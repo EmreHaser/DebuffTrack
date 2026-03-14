@@ -249,10 +249,21 @@ local function CreateFlatButton(parent, width, height, text)
     button:SetScript("OnEnter", function(self)
         self.isHovered = true
         UpdateButtonVisual(self)
+        if self.tooltipTitle or self.tooltipText then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            if self.tooltipTitle then
+                GameTooltip:AddLine(self.tooltipTitle, 1, 0.82, 0.15)
+            end
+            if self.tooltipText then
+                GameTooltip:AddLine(self.tooltipText, 0.92, 0.92, 0.92, true)
+            end
+            GameTooltip:Show()
+        end
     end)
     button:SetScript("OnLeave", function(self)
         self.isHovered = false
         UpdateButtonVisual(self)
+        GameTooltip:Hide()
     end)
 
     function button:SetSelected(selected)
@@ -334,12 +345,12 @@ local function ToggleFilterToken(configFrame, token)
                 nextOrder[#nextOrder + 1] = current
             end
         end
-        SetFilterInputValue(configFrame, table.concat(nextOrder, "|"))
+        ApplyAuraFilter(configFrame, table.concat(nextOrder, "|"))
         return
     end
 
     order[#order + 1] = token
-    SetFilterInputValue(configFrame, NormalizeFilterValue(table.concat(order, "|"), true))
+    ApplyAuraFilter(configFrame, NormalizeFilterValue(table.concat(order, "|"), true))
 end
 
 local function ApplyCustomBorderColor(configFrame)
@@ -483,60 +494,35 @@ function addon:CreateConfigFrame()
         nil
     )
 
-    local filterLabel = filterSection:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    filterLabel:SetPoint("TOPLEFT", 16, filterSection.contentTop)
-    filterLabel:SetText("Filter String")
-
     local filterInput = CreateFrame("EditBox", nil, filterSection, "InputBoxTemplate")
     filterInput:SetSize(360, 28)
-    filterInput:SetPoint("TOPLEFT", 16, filterSection.contentTop - 22)
+    filterInput:SetPoint("TOPLEFT", 16, filterSection.contentTop)
     filterInput:SetAutoFocus(false)
+    filterInput:Hide()
     frame.filterInput = filterInput
 
     filterInput:SetScript("OnTextChanged", function()
         UpdateTokenButtonStates(frame)
     end)
 
-    local applyButton = CreateFlatButton(filterSection, 96, 24, "Apply")
-    applyButton:SetPoint("LEFT", filterInput, "RIGHT", 10, 0)
-    applyButton:SetScript("OnClick", function()
-        ApplyAuraFilter(frame, filterInput:GetText())
-    end)
-
-    local resetButton = CreateFlatButton(filterSection, 118, 24, "Reset Default")
-    resetButton:SetPoint("LEFT", applyButton, "RIGHT", 8, 0)
-    resetButton:SetScript("OnClick", function()
-        ApplyAuraFilter(frame, DEFAULT_AURA_FILTER)
-    end)
-
-    local clearButton = CreateFlatButton(filterSection, 80, 24, "Clear")
-    clearButton:SetPoint("LEFT", resetButton, "RIGHT", 8, 0)
-    clearButton:SetScript("OnClick", function()
-        SetFilterInputValue(frame, "")
-    end)
-
-    filterInput:SetScript("OnEnterPressed", function(self)
-        ApplyAuraFilter(frame, self:GetText())
-    end)
-
     local tokenHint = CreateWrappedText(
         filterSection,
-        "Buttons use readable names. The raw API token string stays in the field above.",
+        "Click tokens to toggle them. Changes apply immediately.",
         CONTENT_WIDTH - 32,
         "GameFontDisableSmall"
     )
-    tokenHint:SetPoint("TOPLEFT", 16, filterSection.contentTop - 60)
+    tokenHint:SetPoint("TOPLEFT", 16, filterSection.contentTop)
 
     local selectedFiltersLabel = filterSection:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    selectedFiltersLabel:SetPoint("TOPLEFT", 16, filterSection.contentTop - 84)
+    selectedFiltersLabel:SetPoint("TOPLEFT", 16, filterSection.contentTop - 24)
     selectedFiltersLabel:SetText("Selected Filters")
 
     local selectedFiltersText = CreateWrappedText(filterSection, "None", CONTENT_WIDTH - 32, "GameFontHighlightSmall")
-    selectedFiltersText:SetPoint("TOPLEFT", 16, filterSection.contentTop - 104)
+    selectedFiltersText:SetPoint("TOPLEFT", 16, filterSection.contentTop - 44)
     frame.selectedFiltersText = selectedFiltersText
 
     frame.tokenButtons = {}
-    local gridTop = filterSection.contentTop - 156
+    local gridTop = filterSection.contentTop - 92
     local gridColumns = 4
     local buttonWidth = 164
     local buttonHeight = 26
@@ -550,41 +536,17 @@ function addon:CreateConfigFrame()
         local button = CreateFlatButton(filterSection, buttonWidth, buttonHeight, item.label)
         button:SetPoint("TOPLEFT", 16 + column * (buttonWidth + xGap), gridTop - row * (buttonHeight + yGap))
         button.token = item.token
+        button.tooltipTitle = item.label
+        button.tooltipText = item.summary
         button:SetScript("OnClick", function()
             ToggleFilterToken(frame, item.token)
         end)
         frame.tokenButtons[#frame.tokenButtons + 1] = button
     end
 
-    local summaryTitle = filterSection:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    summaryTitle:SetPoint("TOPLEFT", 16, gridTop - tokenRows * (buttonHeight + yGap) - 6)
-    summaryTitle:SetText("Token Summary")
-
-    local summaryTop = gridTop - tokenRows * (buttonHeight + yGap) - 30
-    local summaryColumnWidth = 330
-    local summaryRowHeight = 40
-    local badgeWidth = 148
-
-    for index, item in ipairs(FILTER_TOKENS) do
-        local row = math.floor((index - 1) / 2)
-        local column = (index - 1) % 2
-        local baseX = 16 + column * (summaryColumnWidth + 16)
-        local baseY = summaryTop - row * summaryRowHeight
-
-        local badge = CreateFlatButton(filterSection, badgeWidth, 20, item.label)
-        badge:SetPoint("TOPLEFT", baseX, baseY)
-        badge:SetSelected(true)
-        badge:EnableMouse(false)
-
-        local summary = CreateWrappedText(filterSection, item.summary, summaryColumnWidth - badgeWidth - 10, "GameFontHighlightSmall")
-        summary:SetPoint("TOPLEFT", baseX + badgeWidth + 10, baseY - 1)
-    end
-
-    local summaryRows = math.ceil(#FILTER_TOKENS / 2)
-    local summaryBottom = summaryTop - ((summaryRows - 1) * summaryRowHeight) - 34
-    local sectionHeight = math.abs(summaryBottom) + 28
-    if sectionHeight < 540 then
-        sectionHeight = 540
+    local sectionHeight = math.abs(gridTop - tokenRows * (buttonHeight + yGap)) + 64
+    if sectionHeight < 340 then
+        sectionHeight = 340
     end
 
     filterSection:SetHeight(sectionHeight)

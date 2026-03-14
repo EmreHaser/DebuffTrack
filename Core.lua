@@ -1,7 +1,11 @@
 local addonName, addon = ...
 DebuffTrack = addon
 
-addon.version = "1.0.0"
+addon.version = "1.0.3"
+
+local function GetDisplayVersion()
+    return tostring(addon.version or "0.0.0")
+end
 
 -- Default saved-variable structure
 local defaults = {
@@ -9,7 +13,7 @@ local defaults = {
     manualSpells  = {},   -- [spellId] = true
     trackAllDebuffs = false,
     auraFilter = "HARMFUL|RAID",
-    borderMode = "custom", -- "custom" | "blizzard"
+    borderMode = "blizzard", -- "custom" | "blizzard"
     customBorderColor = {
         r = 0,
         g = 0,
@@ -86,7 +90,7 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         self:RegisterEvent("PLAYER_LOGIN")
 
         self:UnregisterEvent("ADDON_LOADED")
-    print("|cff00ccffDebuff Tracker|r v" .. addon.version .. " loaded.  |cff00ff00/dba|r for settings.  Use |cff00ff00Edit Mode|r to reposition.")
+    print("|cff00ccffDebuff Tracker|r v" .. GetDisplayVersion() .. " loaded.  |cff00ff00/dba|r for settings.  Use |cff00ff00Edit Mode|r to reposition.")
 
     elseif event == "PLAYER_LOGIN" then
         self:UnregisterEvent("PLAYER_LOGIN")
