@@ -1,5 +1,5 @@
 <Ui xmlns="http://www.blizzard.com/wow/ui/">
-    <Button name="DebuffAddonAuraButtonTemplate" virtual="true" inherits="SecureActionButtonTemplate">
+    <Button name="DebuffTrackAuraButtonTemplate" virtual="true" inherits="SecureActionButtonTemplate">
         <Size x="36" y="36"/>
         <Layers>
             <Layer level="BACKGROUND">

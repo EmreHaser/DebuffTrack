@@ -288,7 +288,7 @@ local function RunApiCall(frame)
 end
 
 function addon:CreateApiDebugFrame()
-    local frame = CreateFrame("Frame", "DebuffAddonApiDebugFrame", UIParent, "BackdropTemplate")
+    local frame = CreateFrame("Frame", "DebuffTrackApiDebugFrame", UIParent, "BackdropTemplate")
     frame:SetSize(DEBUG_FRAME_WIDTH, DEBUG_FRAME_HEIGHT)
     frame:SetPoint("CENTER", 0, 0)
     frame:SetFrameStrata("DIALOG")
@@ -307,7 +307,7 @@ function addon:CreateApiDebugFrame()
     frame:SetBackdropColor(0.06, 0.06, 0.06, 0.96)
     frame:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
 
-    tinsert(UISpecialFrames, "DebuffAddonApiDebugFrame")
+    tinsert(UISpecialFrames, "DebuffTrackApiDebugFrame")
 
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOP", 0, -14)

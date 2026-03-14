@@ -399,7 +399,7 @@ local function EnsureScanTooltip()
         return nil
     end
 
-    scanTooltip = CreateFrame("GameTooltip", "DebuffAddonScanTooltip", UIParent, "GameTooltipTemplate")
+    scanTooltip = CreateFrame("GameTooltip", "DebuffTrackScanTooltip", UIParent, "GameTooltipTemplate")
     if not scanTooltip then
         return nil
     end
@@ -2613,7 +2613,7 @@ function addon:CreateLayoutEditor()
         return layoutEditorFrame
     end
 
-    local frame = CreateFrame("Frame", "DebuffAddonLayoutEditorFrame", UIParent, "BackdropTemplate")
+    local frame = CreateFrame("Frame", "DebuffTrackLayoutEditorFrame", UIParent, "BackdropTemplate")
     frame:SetSize(720, 540)
     frame:SetPoint("CENTER")
     frame:SetFrameStrata("DIALOG")

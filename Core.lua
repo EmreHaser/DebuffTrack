@@ -1,5 +1,5 @@
 local addonName, addon = ...
-DebuffAddon = addon
+DebuffTrack = addon
 
 addon.version = "1.0.0"
 
@@ -59,23 +59,28 @@ eventFrame:RegisterEvent("PLAYER_LOGOUT")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
-        if not DebuffAddonDB then
-            DebuffAddonDB = {}
+        if not DebuffTrackDB then
+            if type(DebuffAddonDB) == "table" then
+                DebuffTrackDB = CopyTable(DebuffAddonDB)
+            else
+                DebuffTrackDB = {}
+            end
         end
 
         -- Fill in any missing default keys
         for k, v in pairs(defaults) do
-            if DebuffAddonDB[k] == nil then
+            if DebuffTrackDB[k] == nil then
                 if type(v) == "table" then
-                    DebuffAddonDB[k] = CopyTable(v)
+                    DebuffTrackDB[k] = CopyTable(v)
                 else
-                    DebuffAddonDB[k] = v
+                    DebuffTrackDB[k] = v
                 end
             end
         end
 
-        addon.db = DebuffAddonDB
+        addon.db = DebuffTrackDB
         addon.db.trackAllDebuffs = false
+        DebuffAddonDB = nil
 
         -- Wait for PLAYER_LOGIN to init tracker (avoids C_Timer.After taint)
         self:RegisterEvent("PLAYER_LOGIN")
@@ -100,10 +105,10 @@ end)
 ------------------------------------------------------------
 -- Slash commands
 ------------------------------------------------------------
-SLASH_DEBUFFADDON1 = "/debuffaddon"
-SLASH_DEBUFFADDON2 = "/dba"
+SLASH_DEBUFFTRACK1 = "/debufftrack"
+SLASH_DEBUFFTRACK2 = "/dba"
 
-SlashCmdList["DEBUFFADDON"] = function(msg)
+SlashCmdList["DEBUFFTRACK"] = function(msg)
     msg = strtrim(msg or ""):lower()
 
     -- Safety: make sure DB is loaded

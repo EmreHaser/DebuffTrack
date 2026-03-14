@@ -399,7 +399,7 @@ function addon:OpenConfig()
 end
 
 function addon:CreateConfigFrame()
-    local frame = CreateFrame("Frame", "DebuffAddonConfigFrame", UIParent, "BackdropTemplate")
+    local frame = CreateFrame("Frame", "DebuffTrackConfigFrame", UIParent, "BackdropTemplate")
     frame:SetSize(FRAME_WIDTH, FRAME_HEIGHT)
     frame:SetPoint("CENTER")
     frame:SetFrameStrata("DIALOG")
@@ -418,7 +418,7 @@ function addon:CreateConfigFrame()
     frame:SetBackdropColor(0.04, 0.04, 0.05, 0.97)
     frame:SetBackdropBorderColor(0.36, 0.36, 0.38, 1)
 
-    tinsert(UISpecialFrames, "DebuffAddonConfigFrame")
+    tinsert(UISpecialFrames, "DebuffTrackConfigFrame")
 
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 18, -16)
