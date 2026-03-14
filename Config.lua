@@ -23,8 +23,10 @@ local FILTER_TOKENS = {
 }
 
 local TOKEN_ORDER = {}
+local TOKEN_META = {}
 for index, item in ipairs(FILTER_TOKENS) do
     TOKEN_ORDER[item.token] = index
+    TOKEN_META[item.token] = item
 end
 
 local function CreateScrollableFrame(parent)
@@ -286,9 +288,22 @@ local function UpdateTokenButtonStates(configFrame)
         return
     end
 
-    local _, tokenSet = ParseFilterTokens(configFrame.filterInput and configFrame.filterInput:GetText() or "")
+    local order, tokenSet = ParseFilterTokens(configFrame.filterInput and configFrame.filterInput:GetText() or "")
     for _, button in ipairs(configFrame.tokenButtons) do
         button:SetSelected(tokenSet[button.token] == true)
+    end
+
+    if configFrame.selectedFiltersText then
+        if #order == 0 then
+            configFrame.selectedFiltersText:SetText("None")
+        else
+            local labels = {}
+            for _, token in ipairs(order) do
+                local item = TOKEN_META[token]
+                labels[#labels + 1] = item and item.label or token
+            end
+            configFrame.selectedFiltersText:SetText(table.concat(labels, "  •  "))
+        end
     end
 end
 
@@ -506,25 +521,33 @@ function addon:CreateConfigFrame()
 
     local tokenHint = CreateWrappedText(
         filterSection,
-        "Token buttons update the filter field. Select one or more tokens, then press Apply.",
+        "Buttons use readable names. The raw API token string stays in the field above.",
         CONTENT_WIDTH - 32,
         "GameFontDisableSmall"
     )
     tokenHint:SetPoint("TOPLEFT", 16, filterSection.contentTop - 60)
 
+    local selectedFiltersLabel = filterSection:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    selectedFiltersLabel:SetPoint("TOPLEFT", 16, filterSection.contentTop - 84)
+    selectedFiltersLabel:SetText("Selected Filters")
+
+    local selectedFiltersText = CreateWrappedText(filterSection, "None", CONTENT_WIDTH - 32, "GameFontHighlightSmall")
+    selectedFiltersText:SetPoint("TOPLEFT", 16, filterSection.contentTop - 104)
+    frame.selectedFiltersText = selectedFiltersText
+
     frame.tokenButtons = {}
-    local gridTop = filterSection.contentTop - 92
+    local gridTop = filterSection.contentTop - 156
     local gridColumns = 4
     local buttonWidth = 164
-    local buttonHeight = 24
+    local buttonHeight = 26
     local xGap = 8
-    local yGap = 10
+    local yGap = 12
     local tokenRows = math.ceil(#FILTER_TOKENS / gridColumns)
 
     for index, item in ipairs(FILTER_TOKENS) do
         local row = math.floor((index - 1) / gridColumns)
         local column = (index - 1) % gridColumns
-        local button = CreateFlatButton(filterSection, buttonWidth, buttonHeight, item.token)
+        local button = CreateFlatButton(filterSection, buttonWidth, buttonHeight, item.label)
         button:SetPoint("TOPLEFT", 16 + column * (buttonWidth + xGap), gridTop - row * (buttonHeight + yGap))
         button.token = item.token
         button:SetScript("OnClick", function()
@@ -548,7 +571,7 @@ function addon:CreateConfigFrame()
         local baseX = 16 + column * (summaryColumnWidth + 16)
         local baseY = summaryTop - row * summaryRowHeight
 
-        local badge = CreateFlatButton(filterSection, badgeWidth, 20, item.token)
+        local badge = CreateFlatButton(filterSection, badgeWidth, 20, item.label)
         badge:SetPoint("TOPLEFT", baseX, baseY)
         badge:SetSelected(true)
         badge:EnableMouse(false)
