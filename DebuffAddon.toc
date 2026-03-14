@@ -1,0 +1,14 @@
+## Interface: 120001
+## Title: Debuff Addon
+## Notes: Dungeon and Raid debuff tracker addon.
+## Author: Emre
+## Version: 1.0.0
+## IconTexture: Interface\Icons\Spell_Shadow_AuraOfDarkness
+## SavedVariables: DebuffAddonDB
+
+Data.lua
+Core.lua
+Config.lua
+Manual.lua
+DebugUI.lua
+Tracker.lua

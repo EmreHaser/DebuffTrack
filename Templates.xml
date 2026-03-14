@@ -1,0 +1,69 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/">
+    <Button name="DebuffAddonAuraButtonTemplate" virtual="true" inherits="SecureActionButtonTemplate">
+        <Size x="36" y="36"/>
+        <Layers>
+            <Layer level="BACKGROUND">
+                <Texture name="$parentBackground" parentKey="bg" file="Interface\Buttons\WHITE8X8">
+                    <Anchors>
+                        <Anchor point="TOPLEFT"/>
+                        <Anchor point="BOTTOMRIGHT"/>
+                    </Anchors>
+                    <Color r="0" g="0" b="0" a="0.8"/>
+                </Texture>
+            </Layer>
+            <Layer level="ARTWORK">
+                <Texture name="$parentIcon" parentKey="icon">
+                    <Anchors>
+                        <Anchor point="TOPLEFT" x="2" y="-2"/>
+                        <Anchor point="BOTTOMRIGHT" x="-2" y="2"/>
+                    </Anchors>
+                    <TexCoords left="0.08" right="0.92" top="0.08" bottom="0.92"/>
+                </Texture>
+            </Layer>
+            <Layer level="OVERLAY">
+                <Texture name="$parentBorderTop" parentKey="borderTop" file="Interface\Buttons\WHITE8X8">
+                    <Anchors>
+                        <Anchor point="TOPLEFT"/>
+                        <Anchor point="TOPRIGHT"/>
+                    </Anchors>
+                    <Size y="2"/>
+                    <Color r="0.8" g="0" b="0" a="1"/>
+                </Texture>
+                <Texture name="$parentBorderBottom" parentKey="borderBottom" file="Interface\Buttons\WHITE8X8">
+                    <Anchors>
+                        <Anchor point="BOTTOMLEFT"/>
+                        <Anchor point="BOTTOMRIGHT"/>
+                    </Anchors>
+                    <Size y="2"/>
+                    <Color r="0.8" g="0" b="0" a="1"/>
+                </Texture>
+                <Texture name="$parentBorderLeft" parentKey="borderLeft" file="Interface\Buttons\WHITE8X8">
+                    <Anchors>
+                        <Anchor point="TOPLEFT"/>
+                        <Anchor point="BOTTOMLEFT"/>
+                    </Anchors>
+                    <Size x="2"/>
+                    <Color r="0.8" g="0" b="0" a="1"/>
+                </Texture>
+                <Texture name="$parentBorderRight" parentKey="borderRight" file="Interface\Buttons\WHITE8X8">
+                    <Anchors>
+                        <Anchor point="TOPRIGHT"/>
+                        <Anchor point="BOTTOMRIGHT"/>
+                    </Anchors>
+                    <Size x="2"/>
+                    <Color r="0.8" g="0" b="0" a="1"/>
+                </Texture>
+                <FontString name="$parentCount" parentKey="count" inherits="NumberFontNormalSmall">
+                    <Anchors>
+                        <Anchor point="BOTTOMRIGHT" x="-2" y="2"/>
+                    </Anchors>
+                </FontString>
+                <FontString name="$parentDuration" parentKey="duration" inherits="GameFontNormalSmall">
+                    <Anchors>
+                        <Anchor point="TOP" relativePoint="BOTTOM" x="0" y="-1"/>
+                    </Anchors>
+                </FontString>
+            </Layer>
+        </Layers>
+    </Button>
+</Ui>
