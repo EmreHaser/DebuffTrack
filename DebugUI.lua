@@ -100,6 +100,7 @@ local function SplitArgumentString(text)
     local current = {}
     local quote = nil
     local escape = false
+    local bracketDepth = 0
 
     for i = 1, #text do
         local ch = text:sub(i, i)
@@ -114,10 +115,18 @@ local function SplitArgumentString(text)
             if ch == quote then
                 quote = nil
             end
+        elseif ch == "[" then
+            current[#current + 1] = ch
+            bracketDepth = bracketDepth + 1
+        elseif ch == "]" then
+            current[#current + 1] = ch
+            if bracketDepth > 0 then
+                bracketDepth = bracketDepth - 1
+            end
         elseif ch == "\"" or ch == "'" then
             current[#current + 1] = ch
             quote = ch
-        elseif ch == "," then
+        elseif ch == "," and bracketDepth == 0 then
             result[#result + 1] = table.concat(current)
             current = {}
         else
@@ -136,6 +145,18 @@ local function ParseArgumentToken(token)
     token = strtrim(token or "")
     if token == "" then
         return nil, false
+    end
+
+    if token:sub(1, 1) == "[" and token:sub(-1) == "]" and #token >= 2 then
+        local inner = token:sub(2, -2)
+        local values = {}
+        for _, innerToken in ipairs(SplitArgumentString(inner)) do
+            local value, hasValue = ParseArgumentToken(innerToken)
+            if hasValue then
+                values[#values + 1] = value
+            end
+        end
+        return values, true
     end
 
     if token == "true" then
@@ -177,6 +198,37 @@ local function ParseArguments(text)
             args[#args + 1] = value
         end
     end
+    return args
+end
+
+local function IsStringArray(value)
+    if type(value) ~= "table" or #value == 0 then
+        return false
+    end
+
+    for i = 1, #value do
+        if type(value[i]) ~= "string" or value[i] == "" then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function NormalizeMethodArgs(methodPath, args)
+    if type(args) ~= "table" then
+        return args
+    end
+
+    if methodPath == "C_UnitAuras.GetDebuffDataByIndex"
+        or methodPath == "C_UnitAuras.GetAuraDataByIndex"
+        or methodPath == "UnitAura"
+    then
+        if IsStringArray(args[3]) then
+            args[3] = table.concat(args[3], "|")
+        end
+    end
+
     return args
 end
 
@@ -263,7 +315,7 @@ local function RunApiCall(frame)
         return
     end
 
-    local args = ParseArguments(argsText)
+    local args = NormalizeMethodArgs(methodPath, ParseArguments(argsText))
     local results = PackResults(pcall(fn, unpack(args)))
     local lines = {}
     lines[#lines + 1] = "method = " .. methodPath
@@ -367,7 +419,7 @@ function addon:CreateApiDebugFrame()
 
     local helpText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     helpText:SetPoint("TOPLEFT", argsEdit, "BOTTOMLEFT", -6, -14)
-    helpText:SetText("Examples: C_UnitAuras.GetUnitAuraBySpellID  |  args: \"player\", 1251594")
+    helpText:SetText("Examples: C_UnitAuras.GetUnitAuraBySpellID  |  args: \"player\", 1251594  |  list args: [\"HARMFUL\", \"RAID\"]")
 
     frame.output = CreateScrollableOutput(frame, DEBUG_FRAME_WIDTH - 32, DEBUG_FRAME_HEIGHT - 190)
     frame.output:SetPoint("TOPLEFT", helpText, "BOTTOMLEFT", 0, -14)

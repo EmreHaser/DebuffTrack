@@ -1,7 +1,7 @@
 local addonName, addon = ...
 DebuffTrack = addon
 
-addon.version = "1.0.3"
+addon.version = "1.1.0"
 
 local function GetDisplayVersion()
     return tostring(addon.version or "0.0.0")
@@ -12,9 +12,16 @@ local defaults = {
     trackedSpells = {},   -- [spellId] = true
     manualSpells  = {},   -- [spellId] = true
     trackAllDebuffs = false,
-    auraFilter = "HARMFUL|RAID",
+    auraFilter = "HARMFUL",
+    coTankAuraFilter = "HARMFUL",
     borderMode = "blizzard", -- "custom" | "blizzard"
+    coTankBorderMode = "blizzard",
     customBorderColor = {
+        r = 0,
+        g = 0,
+        b = 0,
+    },
+    coTankCustomBorderColor = {
         r = 0,
         g = 0,
         b = 0,
@@ -30,12 +37,44 @@ local defaults = {
         durationOffsetY = -26,
         durationFontSize = 16,
     },
+    coTankLayout = {
+        iconWidth = 30,
+        iconHeight = 30,
+        frameWidth = 252,
+        barHeight = 44,
+        barTextFontSize = 16,
+        borderThickness = 2,
+        countOffsetX = 10,
+        countOffsetY = -8,
+        countFontSize = 16,
+        durationOffsetX = 0,
+        durationOffsetY = -22,
+        durationFontSize = 14,
+        barFillColor = {
+            r = 0.08,
+            g = 0.93,
+            b = 0.62,
+        },
+        barBackgroundColor = {
+            r = 0.04,
+            g = 0.16,
+            b = 0.11,
+        },
+    },
     framePosition = {
         point         = "CENTER",
         relativePoint = "CENTER",
         x             = 0,
         y             = 0,
     },
+    coTankFramePosition = {
+        point         = "TOPLEFT",
+        relativePoint = "BOTTOMLEFT",
+        x             = 0,
+        y             = -10,
+    },
+    coTankEnabled = true,
+    coTankShowPlayer = false,
     locked = false,
 }
 
@@ -86,6 +125,10 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         addon.db.trackAllDebuffs = false
         DebuffAddonDB = nil
 
+        if addon.db.auraFilter == "HARMFUL|RAID" then
+            addon.db.auraFilter = "HARMFUL"
+        end
+
         -- Wait for PLAYER_LOGIN to init tracker (avoids C_Timer.After taint)
         self:RegisterEvent("PLAYER_LOGIN")
 
@@ -102,6 +145,9 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         -- Persist tracker position before logout
         if addon.SaveTrackerPosition then
             addon:SaveTrackerPosition()
+        end
+        if addon.SaveCoTankPosition then
+            addon:SaveCoTankPosition()
         end
     end
 end)
@@ -236,6 +282,9 @@ function addon:ResetConfigDefaults()
     end
 
     addon.db.auraFilter = defaults.auraFilter
+    addon.db.coTankAuraFilter = defaults.coTankAuraFilter
+    addon.db.coTankEnabled = defaults.coTankEnabled
+    addon.db.coTankShowPlayer = defaults.coTankShowPlayer
 
     if addon.UpdateTrackedAuras then
         addon:UpdateTrackedAuras("reset-config-defaults")
@@ -259,6 +308,9 @@ function addon:ResetAllSettings()
     end
     if addon.ResetTrackerPosition then
         addon:ResetTrackerPosition()
+    end
+    if addon.ResetCoTankPosition then
+        addon:ResetCoTankPosition()
     end
     if addon.UpdateTrackerLock then
         addon:UpdateTrackerLock()

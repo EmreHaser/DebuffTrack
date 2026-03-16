@@ -1,15 +1,18 @@
 local addonName, addon = ...
 
 local trackerFrame = nil
+local coTankContainer = nil
 local tickFrame = nil
 local scanTooltip = nil
 local layoutEditorFrame = nil
 local buttons = {}
 local watchButtons = {}
+local coTankFrames = {}
 local trackerEventFrame = CreateFrame("Frame")
 local auraDispelColorCurve = nil
 
 local MAX_ICONS = 10
+local COTANK_MAX_ICONS = 6
 local ICON_SIZE = 36
 local ICON_SPACING = 4
 local ANCHOR_ICON_COUNT = 4
@@ -17,9 +20,19 @@ local TRACKER_NORMAL_STRATA = "TOOLTIP"
 local TRACKER_EDITOR_STRATA = "MEDIUM"
 local EDIT_PREVIEW_ICONS = { 132345, 136033, 463281 }
 local WATCH_ROW_GAP = 10
+local COTANK_SECTION_GAP = 10
+local COTANK_FRAME_GAP = 8
+local COTANK_BAR_STYLE = {
+    defaultHeight = 44,
+    border = 2,
+    iconGap = 6,
+    textInset = 12,
+    minWidth = 252,
+}
 local AURA_MIN_DISPLAY_COUNT = 2
 local AURA_MAX_DISPLAY_COUNT = 99
 local DEFAULT_AURA_FILTER = "IMPORTANT"
+local RAW_AURA_FILTER = "HARMFUL"
 local HIDDEN_MONK_AURAS = {
     [124273] = true, -- Heavy Stagger
     [124274] = true, -- Moderate Stagger
@@ -32,10 +45,14 @@ local lastAuraCount = 0
 local lastUpdateTime = 0
 local lastUpdateReason = "init"
 local activeButtonCount = 0
+local activeCoTankCount = 0
 local lastDebugSnapshot = nil
 local lastCombatSnapshot = nil
 local combatStateActive = false
 local playerGUID = nil
+local coTankUnits = {}
+local coTankDragActive = false
+local runtimeUiHelpers = {}
 local auraCache = {
     byKey = {},
     order = {},
@@ -72,6 +89,103 @@ end
 
 local GetAuraByIndex
 local ScanAllPlayerDebuffs
+local ScanAllUnitDebuffs
+local ScanUnitDebuffs
+local ApplyCoTankFrameLayout
+local ApplyCoTankContainerPosition
+local RefreshCoTankFrames
+local GetCoTankFrameByUnit
+local UpdateCoTankHealthDisplay
+local UpdateTrackerHeight
+
+local function IsUnitPlayer(unit)
+    if not unit then
+        return false
+    end
+
+    if UnitIsUnit then
+        local ok, sameUnit = pcall(UnitIsUnit, unit, "player")
+        if ok then
+            return sameUnit == true
+        end
+    end
+
+    if UnitGUID then
+        local unitGuid = UnitGUID(unit)
+        if unitGuid and playerGUID then
+            return unitGuid == playerGUID
+        end
+    end
+
+    return unit == "player"
+end
+
+local function GetUnitDisplayName(unit)
+    if not unit then
+        return ""
+    end
+
+    if GetUnitName then
+        local ok, value = pcall(GetUnitName, unit, true)
+        if ok and value and value ~= "" then
+            return value
+        end
+    end
+
+    if UnitName then
+        local ok, value = pcall(UnitName, unit)
+        if ok and value and value ~= "" then
+            return value
+        end
+    end
+
+    return tostring(unit)
+end
+
+local function GetRaidTankUnits()
+    local units = {}
+    local includePlayer = addon and addon.db and addon.db.coTankShowPlayer == true
+
+    if not IsInRaid or not IsInRaid() then
+        return units
+    end
+
+    for i = 1, 40 do
+        local unit = "raid" .. i
+        if UnitExists and UnitExists(unit)
+            and UnitGroupRolesAssigned
+            and UnitGroupRolesAssigned(unit) == "TANK"
+            and (includePlayer or not IsUnitPlayer(unit))
+        then
+            units[#units + 1] = unit
+        end
+    end
+
+    table.sort(units, function(left, right)
+        local leftName = GetUnitDisplayName(left)
+        local rightName = GetUnitDisplayName(right)
+        if leftName == rightName then
+            return left < right
+        end
+        return leftName < rightName
+    end)
+
+    return units
+end
+
+local function IsTrackedCoTankUnit(unit)
+    if not unit then
+        return false
+    end
+
+    for _, trackedUnit in ipairs(coTankUnits) do
+        if trackedUnit == unit then
+            return true
+        end
+    end
+
+    return false
+end
 
 local function IsSecretValue(value)
     return issecretvalue and issecretvalue(value) or false
@@ -112,8 +226,44 @@ local function SetAuraQueryFilter(aura, auraFilter)
     return aura
 end
 
-local function GetConfiguredAuraFilter()
-    local configuredFilter = addon and addon.db and addon.db.auraFilter or nil
+local function GetLayoutTargetKey(targetKey)
+    return targetKey == "cotank" and "cotank" or "tracker"
+end
+
+local function GetAuraFilterDbKey(targetKey)
+    return GetLayoutTargetKey(targetKey) == "cotank" and "coTankAuraFilter" or "auraFilter"
+end
+
+local function GetLayoutDbKey(targetKey)
+    return GetLayoutTargetKey(targetKey) == "cotank" and "coTankLayout" or "layout"
+end
+
+local function GetBorderModeDbKey(targetKey)
+    return GetLayoutTargetKey(targetKey) == "cotank" and "coTankBorderMode" or "borderMode"
+end
+
+local function GetBorderColorDbKey(targetKey)
+    return GetLayoutTargetKey(targetKey) == "cotank" and "coTankCustomBorderColor" or "customBorderColor"
+end
+
+local function GetConfiguredAuraFilter(targetKey)
+    local filterKey = GetAuraFilterDbKey(targetKey)
+    local configuredFilter = addon and addon.db and addon.db[filterKey] or nil
+    if type(configuredFilter) == "table" then
+        local filters = {}
+        local seen = {}
+        for _, token in ipairs(configuredFilter) do
+            token = type(token) == "string" and strtrim(string.upper(token)) or nil
+            if token and token ~= "" and not seen[token] then
+                seen[token] = true
+                filters[#filters + 1] = token
+            end
+        end
+        if #filters > 0 then
+            return table.concat(filters, "|")
+        end
+    end
+
     if type(configuredFilter) == "string" then
         configuredFilter = strtrim(configuredFilter)
     end
@@ -134,8 +284,57 @@ local function CanUseAuraIndexFilter(auraFilter)
         or string.find(auraFilter, "HELPFUL", 1, true) ~= nil
 end
 
-local function GetConfiguredCustomBorderColor()
-    local color = addon and addon.db and addon.db.customBorderColor or nil
+local function NormalizeAuraFilterString(auraFilter)
+    if type(auraFilter) ~= "string" then
+        return ""
+    end
+
+    local tokens = {}
+    local seen = {}
+    for token in string.gmatch(string.upper(auraFilter), "[A-Z_]+") do
+        if not seen[token] then
+            seen[token] = true
+            tokens[#tokens + 1] = token
+        end
+    end
+
+    return table.concat(tokens, "|")
+end
+
+local function AuraMatchesConfiguredFilter(aura, auraFilter, unit)
+    if not aura then
+        filterMethodUsed = filterMethodUsed or "RawHARMFUL.NoAura"
+        return false
+    end
+
+    unit = unit or "player"
+
+    local normalizedFilter = NormalizeAuraFilterString(auraFilter)
+    if normalizedFilter == "" or normalizedFilter == RAW_AURA_FILTER then
+        filterMethodUsed = filterMethodUsed or "RawHARMFUL"
+        return true
+    end
+
+    if string.find(normalizedFilter, "HELPFUL", 1, true) ~= nil then
+        filterMethodUsed = filterMethodUsed or "RawHARMFUL.NoHelpful"
+        return false
+    end
+
+    if C_UnitAuras and C_UnitAuras.IsAuraFilteredOutByInstanceID and aura.auraInstanceID ~= nil then
+        local ok, filteredOut = pcall(C_UnitAuras.IsAuraFilteredOutByInstanceID, unit, aura.auraInstanceID, normalizedFilter)
+        if ok then
+            filterMethodUsed = filterMethodUsed or "IsAuraFilteredOutByInstanceID"
+            return not filteredOut
+        end
+    end
+
+    filterMethodUsed = filterMethodUsed or "RawHARMFUL.Fallback"
+    return true
+end
+
+local function GetConfiguredCustomBorderColor(targetKey)
+    local colorKey = GetBorderColorDbKey(targetKey)
+    local color = addon and addon.db and addon.db[colorKey] or nil
     if type(color) ~= "table" then
         return 0, 0, 0
     end
@@ -191,7 +390,35 @@ local function EnsureAuraDispelColorCurve()
     return auraDispelColorCurve
 end
 
-local function GetDefaultLayoutSettings()
+local function CloneBorderColor(color)
+    color = type(color) == "table" and color or {}
+    return {
+        r = tonumber(color.r) or 0,
+        g = tonumber(color.g) or 0,
+        b = tonumber(color.b) or 0,
+    }
+end
+
+local function GetDefaultLayoutSettings(targetKey)
+    if GetLayoutTargetKey(targetKey) == "cotank" then
+        return {
+            iconWidth = 30,
+            iconHeight = 30,
+            frameWidth = 252,
+            barHeight = 44,
+            barTextFontSize = 16,
+            borderThickness = 2,
+            countOffsetX = 10,
+            countOffsetY = -8,
+            countFontSize = 16,
+            durationOffsetX = 0,
+            durationOffsetY = -22,
+            durationFontSize = 14,
+            barFillColor = { r = 0.08, g = 0.93, b = 0.62 },
+            barBackgroundColor = { r = 0.04, g = 0.16, b = 0.11 },
+        }
+    end
+
     return {
         iconWidth = ICON_SIZE,
         iconHeight = ICON_SIZE,
@@ -205,12 +432,12 @@ local function GetDefaultLayoutSettings()
     }
 end
 
-local function CloneLayoutSettings(layout)
-    local defaults = GetDefaultLayoutSettings()
+local function CloneLayoutSettings(layout, targetKey)
+    local defaults = GetDefaultLayoutSettings(targetKey)
     layout = type(layout) == "table" and layout or {}
     local legacyScale = tonumber(layout.scale) or 1
 
-    return {
+    local clone = {
         iconWidth = tonumber(layout.iconWidth) or math.floor((defaults.iconWidth * legacyScale) + 0.5),
         iconHeight = tonumber(layout.iconHeight) or math.floor((defaults.iconHeight * legacyScale) + 0.5),
         borderThickness = tonumber(layout.borderThickness) or defaults.borderThickness,
@@ -221,15 +448,26 @@ local function CloneLayoutSettings(layout)
         durationOffsetY = tonumber(layout.durationOffsetY) or defaults.durationOffsetY,
         durationFontSize = tonumber(layout.durationFontSize) or defaults.durationFontSize,
     }
-end
 
-local function GetConfiguredLayoutSettings()
-    if not addon or not addon.db then
-        return GetDefaultLayoutSettings()
+    if GetLayoutTargetKey(targetKey) == "cotank" then
+        clone.frameWidth = tonumber(layout.frameWidth) or defaults.frameWidth
+        clone.barHeight = tonumber(layout.barHeight) or defaults.barHeight
+        clone.barTextFontSize = tonumber(layout.barTextFontSize) or defaults.barTextFontSize
+        clone.barFillColor = CloneBorderColor(layout.barFillColor or defaults.barFillColor)
+        clone.barBackgroundColor = CloneBorderColor(layout.barBackgroundColor or defaults.barBackgroundColor)
     end
 
-    addon.db.layout = CloneLayoutSettings(addon.db.layout)
-    return addon.db.layout
+    return clone
+end
+
+local function GetConfiguredLayoutSettings(targetKey)
+    if not addon or not addon.db then
+        return GetDefaultLayoutSettings(targetKey)
+    end
+
+    local layoutKey = GetLayoutDbKey(targetKey)
+    addon.db[layoutKey] = CloneLayoutSettings(addon.db[layoutKey], targetKey)
+    return addon.db[layoutKey]
 end
 
 local function ClampIconDimension(value)
@@ -250,6 +488,28 @@ local function ClampFontSize(value)
     end
     if value > 48 then
         return 48
+    end
+    return math.floor(value + 0.5)
+end
+
+local function ClampCoTankFrameWidth(value)
+    value = tonumber(value) or COTANK_BAR_STYLE.minWidth
+    if value < 120 then
+        return 120
+    end
+    if value > 360 then
+        return 360
+    end
+    return math.floor(value + 0.5)
+end
+
+local function ClampCoTankBarHeight(value)
+    value = tonumber(value) or COTANK_BAR_STYLE.defaultHeight
+    if value < 28 then
+        return 28
+    end
+    if value > 80 then
+        return 80
     end
     return math.floor(value + 0.5)
 end
@@ -301,6 +561,153 @@ local function GetLayoutMetrics(layout)
         anchorWidth = math.max((ANCHOR_ICON_COUNT * iconWidth) + ((ANCHOR_ICON_COUNT - 1) * ICON_SPACING), 240),
         anchorHeight = math.max(iconHeight, 44),
     }
+end
+
+local function GetBaseTrackerHeight(layout, watchCount)
+    local metrics = GetLayoutMetrics(layout)
+    if watchCount and watchCount > 0 then
+        return metrics.trackerHeight
+    end
+
+    return metrics.mainRowHeight
+end
+
+local function GetCoTankFrameMetrics(layout)
+    local trackerMetrics = GetLayoutMetrics(layout)
+    local minimumWidth = (COTANK_MAX_ICONS * trackerMetrics.iconWidth) + ((COTANK_MAX_ICONS - 1) * ICON_SPACING)
+    local barWidth = ClampCoTankFrameWidth(layout and layout.frameWidth)
+    local frameWidth = math.max(minimumWidth, barWidth)
+    local barHeight = ClampCoTankBarHeight(layout and layout.barHeight)
+
+    return {
+        frameWidth = frameWidth,
+        barWidth = barWidth,
+        frameHeight = barHeight + COTANK_BAR_STYLE.iconGap + trackerMetrics.mainRowHeight,
+        iconRowOffset = barHeight + COTANK_BAR_STYLE.iconGap,
+        barHeight = barHeight,
+    }
+end
+
+local function IsCoTankFrameEnabled()
+    return not addon or not addon.db or addon.db.coTankEnabled ~= false
+end
+
+local function GetDefaultCoTankPosition()
+    return {
+        point = "TOPLEFT",
+        relativePoint = "BOTTOMLEFT",
+        x = 0,
+        y = -10,
+    }
+end
+
+local function GetPointOffset(point, width, height)
+    local normalizedPoint = tostring(point or "CENTER"):upper()
+    local horizontal = 0.5
+    local vertical = 0.5
+
+    if normalizedPoint:find("LEFT", 1, true) then
+        horizontal = 0
+    elseif normalizedPoint:find("RIGHT", 1, true) then
+        horizontal = 1
+    end
+
+    if normalizedPoint:find("TOP", 1, true) then
+        vertical = 1
+    elseif normalizedPoint:find("BOTTOM", 1, true) then
+        vertical = 0
+    end
+
+    return (width or 0) * horizontal, (height or 0) * vertical
+end
+
+local function GetUiParentAnchorCoordinates(point)
+    local parentWidth = UIParent and UIParent.GetWidth and UIParent:GetWidth() or 0
+    local parentHeight = UIParent and UIParent.GetHeight and UIParent:GetHeight() or 0
+    return GetPointOffset(point, parentWidth, parentHeight)
+end
+
+local function GetAnchorCoordinatesForRect(point, left, bottom, width, height)
+    local pointOffsetX, pointOffsetY = GetPointOffset(point, width, height)
+    return (left or 0) + pointOffsetX, (bottom or 0) + pointOffsetY
+end
+
+local function GetRectFromAnchor(point, anchorX, anchorY, width, height)
+    local pointOffsetX, pointOffsetY = GetPointOffset(point, width, height)
+    return (anchorX or 0) - pointOffsetX, (anchorY or 0) - pointOffsetY
+end
+
+local function GetTrackerRect()
+    if not trackerFrame then
+        return nil
+    end
+
+    local width = trackerFrame.GetWidth and trackerFrame:GetWidth() or 0
+    local height = trackerFrame.GetHeight and trackerFrame:GetHeight() or 0
+    local point, _, relativePoint, x, y = trackerFrame:GetPoint()
+    local anchorX, anchorY = GetUiParentAnchorCoordinates(relativePoint or "CENTER")
+    local left, bottom = GetRectFromAnchor(point or "CENTER", anchorX + (x or 0), anchorY + (y or 0), width, height)
+    return left, bottom, width, height
+end
+
+local function ConvertLegacyCoTankPosition(savedPosition)
+    local source = savedPosition or GetDefaultCoTankPosition()
+    local trackerLeft, trackerBottom, trackerWidth, trackerHeight = GetTrackerRect()
+    if trackerLeft == nil then
+        return {
+            point = source.point or "TOPLEFT",
+            relativePoint = source.point or "TOPLEFT",
+            x = source.x or 0,
+            y = source.y or 0,
+            relativeTo = "UIParent",
+        }
+    end
+
+    local desiredAnchorX, desiredAnchorY = GetAnchorCoordinatesForRect(
+        source.relativePoint or "BOTTOMLEFT",
+        trackerLeft,
+        trackerBottom,
+        trackerWidth or 0,
+        trackerHeight or 0
+    )
+    desiredAnchorX = desiredAnchorX + (source.x or 0)
+    desiredAnchorY = desiredAnchorY + (source.y or 0)
+
+    local point = source.point or "TOPLEFT"
+    local uiParentAnchorX, uiParentAnchorY = GetUiParentAnchorCoordinates(point)
+    return {
+        point = point,
+        relativePoint = point,
+        x = desiredAnchorX - uiParentAnchorX,
+        y = desiredAnchorY - uiParentAnchorY,
+        relativeTo = "UIParent",
+    }
+end
+
+local function GetNormalizedCoTankPosition()
+    local savedPosition = addon and addon.db and addon.db.coTankFramePosition or nil
+    if savedPosition and savedPosition.relativeTo == "UIParent" then
+        return savedPosition
+    end
+
+    local normalized = ConvertLegacyCoTankPosition(savedPosition)
+    if addon and addon.db then
+        addon.db.coTankFramePosition = CopyTable(normalized)
+    end
+    return normalized
+end
+
+local function TryUnitMetric(unit, reader, ...)
+    if not unit or not reader then
+        return nil
+    end
+
+    local ok, value = pcall(reader, unit, ...)
+    if ok then
+        return value
+    end
+
+    return nil
 end
 
 local function SafeTrackedLookup(source, value)
@@ -431,16 +838,18 @@ local function SetTooltipAuraByIndex(tooltip, unit, index, auraFilter)
     return false
 end
 
-local function GetTooltipSpellIDByAuraIndex(index, auraFilter)
+local function GetTooltipSpellIDByAuraIndex(unit, index, auraFilter)
     local tooltip = EnsureScanTooltip()
     if not tooltip then
         return nil
     end
 
+    unit = unit or "player"
+
     if tooltip.ClearLines then
         tooltip:ClearLines()
     end
-    if not SetTooltipAuraByIndex(tooltip, "player", index, auraFilter) then
+    if not SetTooltipAuraByIndex(tooltip, unit, index, auraFilter) then
         return nil
     end
 
@@ -461,7 +870,7 @@ local function GetTooltipSpellIDByAuraIndex(index, auraFilter)
     return nil
 end
 
-local function GetTooltipAuraDebugByAuraIndex(index, auraFilter)
+local function GetTooltipAuraDebugByAuraIndex(unit, index, auraFilter)
     local tooltip = EnsureScanTooltip()
     if not tooltip then
         return {
@@ -471,10 +880,12 @@ local function GetTooltipAuraDebugByAuraIndex(index, auraFilter)
         }
     end
 
+    unit = unit or "player"
+
     if tooltip.ClearLines then
         tooltip:ClearLines()
     end
-    if not SetTooltipAuraByIndex(tooltip, "player", index, auraFilter) then
+    if not SetTooltipAuraByIndex(tooltip, unit, index, auraFilter) then
         return {
             spellId = nil,
             spellName = nil,
@@ -524,12 +935,12 @@ local function IsHiddenMonkAuraSpellId(value)
     return ok and matched or false
 end
 
-local function ShouldHideRawAura(aura)
-    if not aura or not aura.auraIndex or not IsPlayerMonk() then
+local function ShouldHideRawAura(unit, aura)
+    if unit ~= "player" or not aura or not aura.auraIndex or not IsPlayerMonk() then
         return false
     end
 
-    local tooltipDebug = GetTooltipAuraDebugByAuraIndex(aura.auraIndex, aura.queryFilter)
+    local tooltipDebug = GetTooltipAuraDebugByAuraIndex(unit, aura.auraIndex, aura.queryFilter)
     if IsHiddenMonkAuraSpellId(tooltipDebug and tooltipDebug.spellId) then
         return true
     end
@@ -629,17 +1040,19 @@ local function UnpackAuraData(data)
     return name, icon, applications, dispelName, duration, expirationTime, spellId, auraInstanceID
 end
 
-local function ResolveFullAuraData(aura)
+local function ResolveFullAuraData(aura, unit)
     if not aura then
         return nil
     end
+
+    unit = unit or "player"
 
     if aura.auraInstanceID
         and C_UnitAuras
         and C_UnitAuras.GetAuraDataByAuraInstanceID
         and (aura.spellId == nil or aura.icon == nil or aura.name == nil or aura.duration == nil)
     then
-        local fullAura = C_UnitAuras.GetAuraDataByAuraInstanceID("player", aura.auraInstanceID)
+        local fullAura = C_UnitAuras.GetAuraDataByAuraInstanceID(unit, aura.auraInstanceID)
         if fullAura then
             return fullAura
         end
@@ -648,12 +1061,12 @@ local function ResolveFullAuraData(aura)
     return aura
 end
 
-local function NormalizeAura(aura)
+local function NormalizeAura(aura, unit)
     if not aura then
         return nil
     end
 
-    aura = ResolveFullAuraData(aura)
+    aura = ResolveFullAuraData(aura, unit)
 
     return {
         name = aura.name,
@@ -773,22 +1186,22 @@ local function UpdateAuraCacheFromInfo(updateInfo)
     end
 end
 
-GetAuraByIndex = function(index)
-    local auraFilter = GetConfiguredAuraFilter()
+local function GetUnitAuraByIndex(unit, index)
+    unit = unit or "player"
 
     if C_UnitAuras and C_UnitAuras.GetDebuffDataByIndex then
         apiMethodUsed = apiMethodUsed or "GetDebuffDataByIndex"
-        return SetAuraQueryFilter(NormalizeAura(C_UnitAuras.GetDebuffDataByIndex("player", index, auraFilter)), auraFilter)
+        return SetAuraQueryFilter(NormalizeAura(C_UnitAuras.GetDebuffDataByIndex(unit, index), unit), RAW_AURA_FILTER)
     end
 
-    if CanUseAuraIndexFilter(auraFilter) and C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
+    if C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
         apiMethodUsed = apiMethodUsed or "GetAuraDataByIndex"
-        return SetAuraQueryFilter(NormalizeAura(C_UnitAuras.GetAuraDataByIndex("player", index, auraFilter)), auraFilter)
+        return SetAuraQueryFilter(NormalizeAura(C_UnitAuras.GetAuraDataByIndex(unit, index, RAW_AURA_FILTER), unit), RAW_AURA_FILTER)
     end
 
-    if CanUseAuraIndexFilter(auraFilter) and UnitAura then
+    if UnitAura then
         apiMethodUsed = apiMethodUsed or "UnitAura"
-        local name, icon, applications, dispelType, duration, expirationTime, _, _, _, spellId = UnitAura("player", index, auraFilter)
+        local name, icon, applications, dispelType, duration, expirationTime, _, _, _, spellId = UnitAura(unit, index, RAW_AURA_FILTER)
         if not name then
             return nil
         end
@@ -802,10 +1215,14 @@ GetAuraByIndex = function(index)
             expirationTime = expirationTime,
             spellId = spellId,
             auraIndex = index,
-        }, auraFilter)
+        }, RAW_AURA_FILTER)
     end
 
     return nil
+end
+
+GetAuraByIndex = function(index)
+    return GetUnitAuraByIndex("player", index)
 end
 
 function addon:IsSpellTracked(spellId)
@@ -960,20 +1377,20 @@ local function AuraIsHarmful(unit, aura)
     return true
 end
 
-local function ShouldSkipAuraFilter(aura, filter)
+local function ShouldSkipAuraFilter(unit, aura, filter)
     if not aura then
         return true
     end
 
     if filter == "HARMFUL" then
-        return not AuraIsHarmful("player", aura)
+        return not AuraIsHarmful(unit, aura)
     end
 
     return true
 end
 
 local function StoreAuraState(unit, aura)
-    local normalized = NormalizeAura(aura)
+    local normalized = NormalizeAura(aura, unit)
     if not normalized or not normalized.auraInstanceID then
         return
     end
@@ -986,7 +1403,7 @@ local function StoreAuraState(unit, aura)
 
     auraInfo[unit][normalized.auraInstanceID] = normalized
     auraFiltered.HARMFUL[unit][normalized.auraInstanceID] =
-        not ShouldSkipAuraFilter(normalized, "HARMFUL") and normalized or nil
+        not ShouldSkipAuraFilter(unit, normalized, "HARMFUL") and normalized or nil
     AddAuraOrder(unit, normalized.auraInstanceID)
 end
 
@@ -1005,7 +1422,7 @@ local function ProcessExistingHarmfulAuras(unit)
     unit = unit or "player"
     ClearAuraState(unit)
 
-    local rawAuras = ScanAllPlayerDebuffs(40)
+    local rawAuras = ScanAllUnitDebuffs(unit, 40)
     local rawByInstanceID = {}
     for _, aura in ipairs(rawAuras) do
         if aura and aura.auraInstanceID ~= nil then
@@ -1020,7 +1437,7 @@ local function ProcessExistingHarmfulAuras(unit)
             if not aura and C_UnitAuras and C_UnitAuras.GetAuraDataByAuraInstanceID then
                 local ok, auraData = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unit, auraInstanceID)
                 if ok and auraData then
-                    aura = NormalizeAura(auraData)
+                    aura = NormalizeAura(auraData, unit)
                 end
             end
 
@@ -1078,7 +1495,7 @@ local function CollectFilteredAuras(unit, trackedLookup)
     local result = {}
     local filtered = auraFiltered.HARMFUL[unit]
     local order = auraOrder[unit]
-    local rawAuras = ScanAllPlayerDebuffs(40)
+    local rawAuras = ScanAllUnitDebuffs(unit, 40)
     local rawByInstanceID = {}
 
     for _, aura in ipairs(rawAuras) do
@@ -1104,11 +1521,11 @@ local function CollectTrackedAurasByTooltip(unit, trackedLookup)
     unit = unit or "player"
 
     local result = {}
-    local rawAuras = ScanAllPlayerDebuffs(40)
+    local rawAuras = ScanAllUnitDebuffs(unit, 40)
 
     for _, aura in ipairs(rawAuras) do
         if aura and aura.auraIndex then
-            local tooltipDebug = GetTooltipAuraDebugByAuraIndex(aura.auraIndex, aura.queryFilter)
+            local tooltipDebug = GetTooltipAuraDebugByAuraIndex(unit, aura.auraIndex, aura.queryFilter)
             local matched = SafeTrackedLookup(trackedLookup.spellIds, tooltipDebug and tooltipDebug.spellId)
                 or SafeTrackedLookup(trackedLookup.spellIds, tooltipDebug and tooltipDebug.dataId)
                 or SafeTrackedLookup(trackedLookup.spellNames, tooltipDebug and tooltipDebug.spellName)
@@ -1125,17 +1542,17 @@ local function CollectTrackedAurasByTooltip(unit, trackedLookup)
     return result
 end
 
-ScanAllPlayerDebuffs = function(maxCount)
+ScanAllUnitDebuffs = function(unit, maxCount)
+    unit = unit or "player"
     local result = {}
-    local auraFilter = GetConfiguredAuraFilter()
 
     for i = 1, 40 do
-        local aura = GetAuraByIndex(i)
+        local aura = GetUnitAuraByIndex(unit, i)
         if not aura then
             break
         end
         aura.auraIndex = aura.auraIndex or i
-        if not ShouldHideRawAura(aura) then
+        if not ShouldHideRawAura(unit, aura) then
             result[#result + 1] = aura
             if maxCount and #result >= maxCount then
                 break
@@ -1149,8 +1566,8 @@ ScanAllPlayerDebuffs = function(maxCount)
 
     if AuraUtil and AuraUtil.ForEachAura then
         apiMethodUsed = apiMethodUsed or "AuraUtil.ForEachAura"
-        AuraUtil.ForEachAura("player", auraFilter, 40, function(aura)
-            local normalized = SetAuraQueryFilter(NormalizeAura(aura), auraFilter)
+        AuraUtil.ForEachAura(unit, RAW_AURA_FILTER, 40, function(aura)
+            local normalized = SetAuraQueryFilter(NormalizeAura(aura, unit), RAW_AURA_FILTER)
             if normalized then
                 result[#result + 1] = normalized
             end
@@ -1161,8 +1578,12 @@ ScanAllPlayerDebuffs = function(maxCount)
     return result
 end
 
-local function GetFilterAuraByIndex(index)
-    local auraFilter = GetConfiguredAuraFilter()
+ScanAllPlayerDebuffs = function(maxCount)
+    return ScanAllUnitDebuffs("player", maxCount)
+end
+
+local function GetFilterAuraByIndex(index, targetKey)
+    local auraFilter = GetConfiguredAuraFilter(targetKey)
 
     if C_UnitAuras and C_UnitAuras.GetDebuffDataByIndex then
         filterMethodUsed = filterMethodUsed or "GetDebuffDataByIndex"
@@ -1221,11 +1642,11 @@ local function GetFilterAuraByIndex(index)
     return nil
 end
 
-local function ScanFilterablePlayerDebuffs()
+local function ScanFilterablePlayerDebuffs(targetKey)
     local result = {}
 
     for i = 1, 40 do
-        local aura = GetFilterAuraByIndex(i)
+        local aura = GetFilterAuraByIndex(i, targetKey)
         if not aura then
             break
         end
@@ -1254,16 +1675,41 @@ local function ScanTrackedPlayerDebuffs(trackedLookup)
     return result
 end
 
-local function ScanPlayerDebuffs()
-    filterMethodUsed = "Configured.AllDebuffs"
-    return ScanAllPlayerDebuffs(MAX_ICONS)
+ScanUnitDebuffs = function(unit, maxCount, targetKey)
+    unit = unit or "player"
+
+    local configuredFilter = GetConfiguredAuraFilter(targetKey)
+    local result = {}
+    local rawAuras = ScanAllUnitDebuffs(unit, 40)
+    local iconLimit = maxCount or MAX_ICONS
+
+    filterMethodUsed = nil
+    for _, aura in ipairs(rawAuras) do
+        if AuraMatchesConfiguredFilter(aura, configuredFilter, unit) then
+            result[#result + 1] = aura
+            if #result >= iconLimit then
+                break
+            end
+        end
+    end
+
+    filterMethodUsed = filterMethodUsed or "RawHARMFUL.NoMatch"
+    return result
 end
 
-local function GetBorderColor(aura)
-    if addon and addon.db and addon.db.borderMode == "blizzard" then
+local function ScanPlayerDebuffs()
+    return ScanUnitDebuffs("player", MAX_ICONS, "tracker")
+end
+
+local function GetBorderColor(aura, unit, targetKey)
+    unit = unit or "player"
+
+    local borderModeKey = GetBorderModeDbKey(targetKey)
+    local borderMode = addon and addon.db and addon.db[borderModeKey] or "blizzard"
+    if borderMode == "blizzard" then
         local curve = EnsureAuraDispelColorCurve()
         if aura and aura.auraInstanceID and curve and C_UnitAuras and C_UnitAuras.GetAuraDispelTypeColor then
-            local ok, colorOrR, g, b = pcall(C_UnitAuras.GetAuraDispelTypeColor, "player", aura.auraInstanceID, curve)
+            local ok, colorOrR, g, b = pcall(C_UnitAuras.GetAuraDispelTypeColor, unit, aura.auraInstanceID, curve)
             if ok then
                 if type(colorOrR) == "table" then
                     if colorOrR.GetRGB then
@@ -1291,7 +1737,7 @@ local function GetBorderColor(aura)
         end
     end
 
-    return GetConfiguredCustomBorderColor()
+    return GetConfiguredCustomBorderColor(targetKey)
 end
 
 local function ApplyBorderThickness(button, thickness)
@@ -1407,10 +1853,16 @@ local function ApplyTrackerGeometry(layout)
         trackerFrame.editOverlay:SetSize(metrics.anchorWidth, metrics.anchorHeight)
         ApplyBorderThickness(trackerFrame.editOverlay, metrics.borderThickness)
     end
+
+    if coTankContainer then
+        local coTankMetrics = GetCoTankFrameMetrics(GetConfiguredLayoutSettings("cotank"))
+        coTankContainer:SetWidth(coTankMetrics.frameWidth)
+    end
 end
 
 local function RefreshTrackerLayout()
     local layout = GetConfiguredLayoutSettings()
+    local coTankLayout = GetConfiguredLayoutSettings("cotank")
 
     ApplyTrackerGeometry(layout)
 
@@ -1418,6 +1870,15 @@ local function RefreshTrackerLayout()
         ApplyTextLayoutToButton(buttons[i], layout)
         ApplyBorderThickness(watchButtons[i], layout.borderThickness)
     end
+
+    for index, frame in ipairs(coTankFrames) do
+        if frame then
+            ApplyCoTankFrameLayout(frame, index, coTankLayout)
+        end
+    end
+
+    RefreshCoTankFrames()
+    UpdateTrackerHeight(0)
 end
 
 local function UpdateAnchorVisibility()
@@ -1429,8 +1890,14 @@ local function UpdateAnchorVisibility()
 
     if showAnchor then
         trackerFrame.anchor:Show()
+        if coTankContainer and coTankContainer.anchor then
+            coTankContainer.anchor:Show()
+        end
     else
         trackerFrame.anchor:Hide()
+        if coTankContainer and coTankContainer.anchor then
+            coTankContainer.anchor:Hide()
+        end
     end
 end
 
@@ -1440,7 +1907,35 @@ local function UpdateTrackerStrata()
     end
 
     local editorOpen = layoutEditorFrame and layoutEditorFrame.IsShown and layoutEditorFrame:IsShown()
-    trackerFrame:SetFrameStrata(editorOpen and TRACKER_EDITOR_STRATA or TRACKER_NORMAL_STRATA)
+    local strata = editorOpen and TRACKER_EDITOR_STRATA or TRACKER_NORMAL_STRATA
+    trackerFrame:SetFrameStrata(strata)
+
+    local function ApplyStrata(frame)
+        if frame and frame.SetFrameStrata then
+            frame:SetFrameStrata(strata)
+        end
+    end
+
+    ApplyStrata(trackerFrame.anchor)
+    ApplyStrata(trackerFrame.editOverlay)
+    ApplyStrata(coTankContainer)
+    ApplyStrata(coTankContainer and coTankContainer.anchor or nil)
+    ApplyStrata(coTankContainer and coTankContainer.editOverlay or nil)
+
+    for _, button in ipairs(buttons) do
+        ApplyStrata(button)
+    end
+    for _, button in ipairs(watchButtons) do
+        ApplyStrata(button)
+    end
+    for _, frame in ipairs(coTankFrames) do
+        ApplyStrata(frame)
+        if frame and frame.auraButtons then
+            for _, button in ipairs(frame.auraButtons) do
+                ApplyStrata(button)
+            end
+        end
+    end
 end
 
 local function SetButtonVisible(button, visible)
@@ -1522,6 +2017,7 @@ local function ClearButton(button)
     button.spellId = nil
     button.queryFilter = nil
     button.expirationTime = nil
+    button.ownerUnit = nil
 
     if button.icon then
         button.icon:SetTexture(nil)
@@ -1586,18 +2082,25 @@ local function ApplySpellToWatchButton(button, spellInfo)
     SetWatchButtonVisible(button, true)
 end
 
-local function UpdateTrackerHeight(watchCount)
+UpdateTrackerHeight = function(watchCount)
     if not trackerFrame then
         return
     end
 
-    local metrics = GetLayoutMetrics()
-    local height = metrics.mainRowHeight
-    if watchCount and watchCount > 0 then
-        height = metrics.trackerHeight
-    end
+    local layout = GetConfiguredLayoutSettings()
+    local baseHeight = GetBaseTrackerHeight(layout, watchCount)
+    trackerFrame:SetHeight(baseHeight)
 
-    trackerFrame:SetHeight(height)
+    if coTankContainer then
+        if IsInCombat() then
+            addon._pendingCoTankFullRefresh = true
+        else
+            local coTankLayout = GetConfiguredLayoutSettings("cotank")
+            local coTankMetrics = GetCoTankFrameMetrics(coTankLayout)
+            ApplyCoTankContainerPosition()
+            coTankContainer:SetWidth(coTankMetrics.frameWidth)
+        end
+    end
 end
 
 local function RefreshWatchButtons()
@@ -1605,14 +2108,15 @@ local function RefreshWatchButtons()
         ClearWatchButton(watchButtons[i])
     end
 
-    UpdateTrackerHeight(0)
     return 0
 end
 
-local function ApplyAuraToButton(button, aura)
+local function ApplyAuraToButton(button, aura, unit, targetKey)
     if not button then
         return
     end
+
+    unit = unit or button.ownerUnit or "player"
 
     if not aura then
         ClearButton(button)
@@ -1622,9 +2126,9 @@ local function ApplyAuraToButton(button, aura)
     local texID = aura.icon
     local queryFilter = aura.queryFilter
     if texID == nil and aura.auraInstanceID and C_UnitAuras and C_UnitAuras.GetAuraDataByAuraInstanceID then
-        local fullAura = C_UnitAuras.GetAuraDataByAuraInstanceID("player", aura.auraInstanceID)
+        local fullAura = C_UnitAuras.GetAuraDataByAuraInstanceID(unit, aura.auraInstanceID)
         if fullAura then
-            local normalized = NormalizeAura(fullAura)
+            local normalized = NormalizeAura(fullAura, unit)
             if normalized then
                 normalized.queryFilter = queryFilter
                 aura = normalized
@@ -1646,7 +2150,7 @@ local function ApplyAuraToButton(button, aura)
         button.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     end
 
-    local r, g, b = GetBorderColor(aura)
+    local r, g, b = GetBorderColor(aura, unit, targetKey)
     if button.borderTop then button.borderTop:SetColorTexture(r, g, b, 1) end
     if button.borderBottom then button.borderBottom:SetColorTexture(r, g, b, 1) end
     if button.borderLeft then button.borderLeft:SetColorTexture(r, g, b, 1) end
@@ -1655,7 +2159,7 @@ local function ApplyAuraToButton(button, aura)
     if button.count then
         local displayCount = nil
         if aura.auraInstanceID and C_UnitAuras and C_UnitAuras.GetAuraApplicationDisplayCount then
-            displayCount = C_UnitAuras.GetAuraApplicationDisplayCount("player", aura.auraInstanceID, AURA_MIN_DISPLAY_COUNT, AURA_MAX_DISPLAY_COUNT)
+            displayCount = C_UnitAuras.GetAuraApplicationDisplayCount(unit, aura.auraInstanceID, AURA_MIN_DISPLAY_COUNT, AURA_MAX_DISPLAY_COUNT)
         end
 
         if displayCount then
@@ -1669,6 +2173,7 @@ local function ApplyAuraToButton(button, aura)
     button.auraIndex = aura.auraIndex
     button.spellId = aura.spellId
     button.queryFilter = aura.queryFilter
+    button.ownerUnit = unit
     if aura.duration ~= nil and aura.expirationTime ~= nil then
         button.expirationTime = aura.expirationTime
         if button.cooldown then
@@ -1692,7 +2197,7 @@ local function ApplyAuraToButton(button, aura)
         end
     end
 
-    ApplyTextLayoutToButton(button)
+    ApplyTextLayoutToButton(button, GetConfiguredLayoutSettings(targetKey))
     UpdateDuration(button, GetTime())
     SetButtonVisible(button, true)
 end
@@ -1709,43 +2214,78 @@ local function RefreshButtons(reason)
     lastUpdateReason = reason or "manual"
 
     for i = 1, MAX_ICONS do
-        ApplyAuraToButton(buttons[i], auras[i])
+        ApplyAuraToButton(buttons[i], auras[i], "player", "tracker")
     end
 
-    RefreshWatchButtons()
+    local watchCount = RefreshWatchButtons()
+    RefreshCoTankFrames()
+    UpdateTrackerHeight(watchCount)
 
     UpdateAnchorVisibility()
     addon:CaptureDebugSnapshot(reason or "manual")
 end
 
 local function OnTrackerEvent(_, event, unit, updateInfo)
-    if event == "UNIT_AURA" and unit ~= "player" then
-        return
-    end
+    local shouldRefreshTracker = false
 
     if event == "UNIT_AURA" then
-        eventCounters.unitAura = eventCounters.unitAura + 1
-        UpdateAuraStateFromInfo("player", updateInfo)
+        if unit == "player" then
+            eventCounters.unitAura = eventCounters.unitAura + 1
+            UpdateAuraStateFromInfo("player", updateInfo)
+            shouldRefreshTracker = true
+        elseif IsTrackedCoTankUnit(unit) then
+            shouldRefreshTracker = true
+        else
+            return
+        end
+    elseif event == "UNIT_HEALTH"
+        or event == "UNIT_MAXHEALTH"
+        or event == "UNIT_FLAGS"
+        or event == "UNIT_CONNECTION"
+        or event == "UNIT_NAME_UPDATE"
+    then
+        local frame = GetCoTankFrameByUnit(unit)
+        if not frame then
+            return
+        end
+
+        UpdateCoTankHealthDisplay(frame)
+        return
+    elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ROLES_ASSIGNED" then
+        shouldRefreshTracker = true
     elseif event == "PLAYER_REGEN_DISABLED" then
         combatStateActive = true
         eventCounters.enterCombat = eventCounters.enterCombat + 1
+        shouldRefreshTracker = true
     elseif event == "PLAYER_REGEN_ENABLED" then
         eventCounters.leaveCombat = eventCounters.leaveCombat + 1
+        shouldRefreshTracker = true
     elseif event == "PLAYER_ENTERING_WORLD" then
         playerGUID = UnitGUID and UnitGUID("player") or nil
         ProcessExistingHarmfulAuras("player")
+        shouldRefreshTracker = true
     end
 
-    if trackerFrame then
+    if trackerFrame and shouldRefreshTracker then
         addon:UpdateTrackedAuras(event)
     end
 
     if event == "PLAYER_REGEN_ENABLED" then
         combatStateActive = false
+        if trackerFrame and addon._pendingCoTankFullRefresh then
+            addon:UpdateTrackedAuras("combat-exit")
+        end
     end
 end
 
-trackerEventFrame:RegisterUnitEvent("UNIT_AURA", "player")
+trackerEventFrame:RegisterEvent("UNIT_AURA")
+trackerEventFrame:RegisterEvent("UNIT_HEALTH")
+trackerEventFrame:RegisterEvent("UNIT_MAXHEALTH")
+trackerEventFrame:RegisterEvent("UNIT_FLAGS")
+trackerEventFrame:RegisterEvent("UNIT_CONNECTION")
+trackerEventFrame:RegisterEvent("UNIT_NAME_UPDATE")
+trackerEventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+trackerEventFrame:RegisterEvent("PLAYER_ROLES_ASSIGNED")
 trackerEventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 trackerEventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 trackerEventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
@@ -1790,6 +2330,14 @@ local function RefreshButtonPresentation()
         local watchButton = watchButtons[i]
         if watchButton then
             SetWatchButtonVisible(watchButton, watchButton.isActive == true)
+        end
+    end
+
+    for _, frame in ipairs(coTankFrames) do
+        if frame and frame.auraButtons then
+            for _, button in ipairs(frame.auraButtons) do
+                SetButtonVisible(button, button.isActive == true)
+            end
         end
     end
 end
@@ -1882,11 +2430,12 @@ local function CreateAuraButton(parent, index)
             return
         end
 
+        local unit = self.ownerUnit or "player"
         GameTooltip:SetOwner(self, "ANCHOR_BOTTOMRIGHT")
         if self.auraIndex then
-            SetTooltipAuraByIndex(GameTooltip, "player", self.auraIndex, self.queryFilter)
+            SetTooltipAuraByIndex(GameTooltip, unit, self.auraIndex, self.queryFilter)
         elseif self.auraInstanceID and GameTooltip.SetUnitDebuffByAuraInstanceID then
-            GameTooltip:SetUnitDebuffByAuraInstanceID("player", self.auraInstanceID)
+            GameTooltip:SetUnitDebuffByAuraInstanceID(unit, self.auraInstanceID)
         elseif self.spellId and GameTooltip.SetSpellByID then
             GameTooltip:SetSpellByID(self.spellId)
         end
@@ -1978,6 +2527,693 @@ local function CreateWatchButton(parent, index)
     return button
 end
 
+local function EnsureCoTankContainer()
+    if coTankContainer or not trackerFrame then
+        return coTankContainer
+    end
+
+    coTankContainer = CreateFrame("Frame", nil, UIParent)
+    coTankContainer:SetSize(1, 1)
+    coTankContainer:SetClampedToScreen(true)
+    ApplyCoTankContainerPosition(true)
+    coTankContainer:Hide()
+    return coTankContainer
+end
+
+ApplyCoTankContainerPosition = function(force)
+    if not coTankContainer then
+        return
+    end
+
+    if IsInCombat() then
+        addon._pendingCoTankFullRefresh = true
+        return
+    end
+
+    if coTankDragActive and force ~= true then
+        return
+    end
+
+    local pos = GetNormalizedCoTankPosition()
+    coTankContainer:ClearAllPoints()
+    coTankContainer:SetPoint(pos.point, UIParent, pos.relativePoint, pos.x, pos.y)
+end
+
+local function ApplyCoTankBarAppearance(frame, layout, fillR, fillG, fillB)
+    if not frame then
+        return
+    end
+
+    layout = CloneLayoutSettings(layout, "cotank")
+    local barR, barG, barB = fillR, fillG, fillB
+    if barR == nil or barG == nil or barB == nil then
+        local fillColor = CloneBorderColor(layout.barFillColor)
+        barR, barG, barB = fillColor.r, fillColor.g, fillColor.b
+    end
+
+    local bgColor = CloneBorderColor(layout.barBackgroundColor)
+    local bgR, bgG, bgB = bgColor.r, bgColor.g, bgColor.b
+    if frame.healthBar and frame.healthBar.SetStatusBarColor then
+        frame.healthBar:SetStatusBarColor(barR, barG, barB, 1)
+    end
+    if frame.healthBarBg then
+        frame.healthBarBg:SetColorTexture(bgR, bgG, bgB, 0.95)
+    end
+
+    local fontSize = ClampFontSize(layout.barTextFontSize or 16)
+    if frame.nameText and frame.nameText.SetFont and STANDARD_TEXT_FONT then
+        frame.nameText:SetFont(STANDARD_TEXT_FONT, fontSize, "OUTLINE")
+    end
+    if frame.healthText and frame.healthText.SetFont and STANDARD_TEXT_FONT then
+        frame.healthText:SetFont(STANDARD_TEXT_FONT, fontSize, "OUTLINE")
+    end
+end
+
+runtimeUiHelpers.GetUnitClassTag = function(unit)
+    if not unit then
+        return nil
+    end
+
+    if UnitClassBase then
+        local ok, classTag = pcall(UnitClassBase, unit)
+        if ok and classTag and classTag ~= "" then
+            return classTag
+        end
+    end
+
+    if UnitClass then
+        local ok, _, classTag = pcall(UnitClass, unit)
+        if ok and classTag and classTag ~= "" then
+            return classTag
+        end
+    end
+
+    return nil
+end
+
+runtimeUiHelpers.GetUnitClassColor = function(unit)
+    local classTag = runtimeUiHelpers.GetUnitClassTag(unit)
+    if not classTag then
+        return nil
+    end
+
+    if CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[classTag] then
+        local color = CUSTOM_CLASS_COLORS[classTag]
+        return color.r or 1, color.g or 1, color.b or 1
+    end
+
+    if RAID_CLASS_COLORS and RAID_CLASS_COLORS[classTag] then
+        local color = RAID_CLASS_COLORS[classTag]
+        return color.r or 1, color.g or 1, color.b or 1
+    end
+
+    if C_ClassColor and C_ClassColor.GetClassColor then
+        local color = C_ClassColor.GetClassColor(classTag)
+        if color then
+            if color.GetRGB then
+                return color:GetRGB()
+            end
+            return color.r or 1, color.g or 1, color.b or 1
+        end
+    end
+
+    return nil
+end
+
+runtimeUiHelpers.TryFormatCoTankPercentWithStatusBar = function(frame, rawHealthValue)
+    if not frame or not frame.healthBar or not frame.healthBar.GetStatusBarTexture then
+        return nil
+    end
+
+    local healthBar = frame.healthBar
+    local statusBarTexture = healthBar:GetStatusBarTexture()
+    if not statusBarTexture or not statusBarTexture.GetWidth or not healthBar.GetWidth then
+        return nil
+    end
+
+    local totalWidth = runtimeUiHelpers.CoerceDisplayNumber(healthBar:GetWidth())
+    local fillWidth = runtimeUiHelpers.CoerceDisplayNumber(statusBarTexture:GetWidth())
+    if type(totalWidth) ~= "number" or totalWidth <= 0 or type(fillWidth) ~= "number" then
+        return nil
+    end
+
+    if fillWidth <= 0 and not CanAccessValue(rawHealthValue) then
+        return nil
+    end
+
+    local percent = fillWidth / totalWidth
+    if percent < 0 then
+        percent = 0
+    elseif percent > 1 then
+        percent = 1
+    end
+
+    return string.format("%d%%", math.floor((percent * 100) + 0.5))
+end
+
+runtimeUiHelpers.MarkLayoutEditorDirty = function()
+    if layoutEditorFrame then
+        layoutEditorFrame.hasPendingChanges = true
+        layoutEditorFrame.discardChangesOnHide = false
+    end
+end
+
+runtimeUiHelpers.CoerceDisplayNumber = function(value)
+    if value == nil or not CanAccessValue(value) then
+        return nil
+    end
+
+    local ok, normalized = pcall(function()
+        return tonumber(tostring(value))
+    end)
+    if ok then
+        return normalized
+    end
+    return nil
+end
+
+runtimeUiHelpers.GetCurveConstant = function(curveName)
+    if type(CurveConstants) ~= "table" or not curveName then
+        return nil
+    end
+
+    return CurveConstants[curveName]
+end
+
+runtimeUiHelpers.GetUnitHealthPercentValue = function(unit, curve)
+    if not unit or not UnitHealthPercent then
+        return nil
+    end
+
+    if curve ~= nil then
+        local ok, value = pcall(UnitHealthPercent, unit, false, curve)
+        if ok then
+            return value
+        end
+    end
+
+    do
+        local ok, value = pcall(UnitHealthPercent, unit, false)
+        if ok then
+            return value
+        end
+    end
+
+    do
+        local ok, value = pcall(UnitHealthPercent, unit)
+        if ok then
+            return value
+        end
+    end
+
+    return nil
+end
+
+runtimeUiHelpers.ApplyCoTankPercentText = function(fontString, unit)
+    if not fontString or not unit then
+        return false
+    end
+
+    local percentValue = runtimeUiHelpers.GetUnitHealthPercentValue(unit, runtimeUiHelpers.GetCurveConstant("ScaleTo100"))
+    if percentValue == nil then
+        percentValue = runtimeUiHelpers.GetUnitHealthPercentValue(unit)
+    end
+
+    if percentValue == nil then
+        return false
+    end
+
+    if fontString.SetFormattedText then
+        local ok = pcall(fontString.SetFormattedText, fontString, "%0.f%%", percentValue)
+        if ok then
+            return true
+        end
+
+        ok = pcall(fontString.SetFormattedText, fontString, "%s%%", percentValue)
+        if ok then
+            return true
+        end
+    end
+
+    local accessiblePercent = runtimeUiHelpers.CoerceDisplayNumber(percentValue)
+    if accessiblePercent == nil then
+        return false
+    end
+
+    fontString:SetText(string.format("%d%%", math.floor(accessiblePercent + 0.5)))
+    return true
+end
+
+UpdateCoTankHealthDisplay = function(frame)
+    if not frame or not frame.unit then
+        return
+    end
+
+    local unit = frame.unit
+    local layout = GetConfiguredLayoutSettings("cotank")
+    local healthCurrent = TryUnitMetric(unit, UnitHealth)
+    local healthMax = TryUnitMetric(unit, UnitHealthMax)
+    local isDead = UnitIsDeadOrGhost and UnitIsDeadOrGhost(unit) or false
+    local isConnected = UnitIsConnected == nil or UnitIsConnected(unit)
+    local healthPercent = runtimeUiHelpers.GetUnitHealthPercentValue(unit, runtimeUiHelpers.GetCurveConstant("ZeroToOne"))
+    local healthPercentText = nil
+    local healthTextWasApplied = false
+    local classR, classG, classB = runtimeUiHelpers.GetUnitClassColor(unit)
+    local fillColor = CloneBorderColor(layout.barFillColor)
+    local barR, barG, barB = classR or fillColor.r, classG or fillColor.g, classB or fillColor.b
+
+    if not isConnected then
+        barR, barG, barB = 0.28, 0.30, 0.34
+    elseif isDead then
+        barR, barG, barB = 0.55, 0.14, 0.14
+    end
+
+    if frame.nameText then
+        frame.nameText:SetText(GetUnitDisplayName(unit))
+    end
+
+    if frame.healthBar then
+        if frame.healthBar.SetMinMaxValues then
+            local ok = pcall(frame.healthBar.SetMinMaxValues, frame.healthBar, 0, 1)
+            if not ok then
+                frame.healthBar:SetMinMaxValues(0, 1)
+            end
+        end
+        if frame.healthBar.SetValue then
+            local displayValue = healthPercent
+            if not isConnected or isDead then
+                displayValue = 0
+            elseif displayValue == nil then
+                local currentValue = runtimeUiHelpers.CoerceDisplayNumber(healthCurrent)
+                local maxValue = runtimeUiHelpers.CoerceDisplayNumber(healthMax)
+                if type(currentValue) == "number" and type(maxValue) == "number" and maxValue > 0 then
+                    displayValue = currentValue / maxValue
+                end
+            end
+
+            if displayValue ~= nil and CanAccessValue(displayValue) then
+                local accessibleValue = runtimeUiHelpers.CoerceDisplayNumber(displayValue)
+                if accessibleValue ~= nil then
+                    if accessibleValue < 0 then
+                        accessibleValue = 0
+                    elseif accessibleValue > 1 then
+                        if accessibleValue <= 100 then
+                            accessibleValue = accessibleValue / 100
+                        else
+                            accessibleValue = 1
+                        end
+                    end
+
+                    displayValue = accessibleValue
+                end
+            end
+
+            if displayValue == nil then
+                displayValue = 0
+            end
+
+            local ok = pcall(frame.healthBar.SetValue, frame.healthBar, displayValue)
+            if not ok then
+                frame.healthBar:SetValue(0)
+            end
+        end
+    end
+
+    if isConnected and not isDead and frame.healthText then
+        healthTextWasApplied = runtimeUiHelpers.ApplyCoTankPercentText(frame.healthText, unit)
+    end
+
+    if not healthTextWasApplied then
+        healthPercentText = runtimeUiHelpers.TryFormatCoTankPercentWithStatusBar(frame, healthCurrent)
+    end
+
+    if not healthTextWasApplied and not healthPercentText then
+        local displayHealth = healthPercent
+        local displayMax = healthPercent ~= nil and 1 or nil
+        if displayHealth == nil and frame.healthBar and frame.healthBar.GetStatusBarTexture and frame.healthBar.GetWidth then
+            healthPercentText = runtimeUiHelpers.TryFormatCoTankPercentWithStatusBar(frame, healthCurrent)
+        end
+
+        if not healthPercentText then
+            local percentOk, computedPercent, computedPercentText = pcall(function()
+                local currentValue = runtimeUiHelpers.CoerceDisplayNumber(displayHealth) or runtimeUiHelpers.CoerceDisplayNumber(healthCurrent)
+                local maxValue = runtimeUiHelpers.CoerceDisplayNumber(displayMax) or runtimeUiHelpers.CoerceDisplayNumber(healthMax)
+                if type(currentValue) ~= "number" or type(maxValue) ~= "number" or maxValue <= 0 then
+                    return nil, nil
+                end
+
+                local percent = currentValue / maxValue
+                return percent, string.format("%d%%", math.floor((percent * 100) + 0.5))
+            end)
+
+            if percentOk then
+                healthPercent = computedPercent
+                healthPercentText = computedPercentText
+            end
+        end
+    end
+
+    ApplyCoTankBarAppearance(frame, layout, barR, barG, barB)
+
+    if frame.healthText then
+        if not isConnected then
+            frame.healthText:SetText("Offline")
+        elseif isDead then
+            frame.healthText:SetText("Dead")
+        elseif not healthTextWasApplied and healthPercentText then
+            frame.healthText:SetText(healthPercentText)
+        elseif not healthTextWasApplied then
+            frame.healthText:SetText("--")
+        end
+    end
+end
+
+ApplyCoTankFrameLayout = function(frame, index, layout)
+    if not frame then
+        return
+    end
+
+    layout = layout or GetConfiguredLayoutSettings("cotank")
+    local trackerMetrics = GetLayoutMetrics(layout)
+    local coTankMetrics = GetCoTankFrameMetrics(layout)
+
+    frame:ClearAllPoints()
+    frame:SetPoint("TOPLEFT", 0, -((index - 1) * (coTankMetrics.frameHeight + COTANK_FRAME_GAP)))
+    frame:SetSize(coTankMetrics.frameWidth, coTankMetrics.frameHeight)
+
+    if frame.barFrame then
+        frame.barFrame:ClearAllPoints()
+        frame.barFrame:SetPoint("TOPLEFT", frame, "TOPLEFT", 0, 0)
+        frame.barFrame:SetSize(coTankMetrics.barWidth, coTankMetrics.barHeight)
+    end
+
+    if frame.healthBar then
+        frame.healthBar:ClearAllPoints()
+        frame.healthBar:SetPoint("TOPLEFT", frame.barFrame, "TOPLEFT", COTANK_BAR_STYLE.border, -COTANK_BAR_STYLE.border)
+        frame.healthBar:SetPoint("BOTTOMRIGHT", frame.barFrame, "BOTTOMRIGHT", -COTANK_BAR_STYLE.border, COTANK_BAR_STYLE.border)
+        if frame.healthBar.SetSize then
+            frame.healthBar:SetSize(
+                math.max(1, coTankMetrics.barWidth - (COTANK_BAR_STYLE.border * 2)),
+                math.max(1, coTankMetrics.barHeight - (COTANK_BAR_STYLE.border * 2))
+            )
+        end
+    end
+
+    for buttonIndex = 1, COTANK_MAX_ICONS do
+        local button = frame.auraButtons and frame.auraButtons[buttonIndex]
+        if button then
+            button:ClearAllPoints()
+            button:SetSize(trackerMetrics.iconWidth, trackerMetrics.iconHeight)
+            button:SetPoint(
+                "TOPLEFT",
+                frame,
+                "TOPLEFT",
+                (buttonIndex - 1) * (trackerMetrics.iconWidth + ICON_SPACING),
+                -coTankMetrics.iconRowOffset
+            )
+            ApplyTextLayoutToButton(button, layout)
+        end
+    end
+
+    ApplyCoTankBarAppearance(frame, layout)
+end
+
+local function ClearCoTankFrame(frame)
+    if not frame then
+        return
+    end
+
+    frame.unit = nil
+    if frame.SetAttribute and not IsInCombat() then
+        frame:SetAttribute("unit", nil)
+    end
+    if frame.nameText then
+        frame.nameText:SetText("")
+    end
+    if frame.healthText then
+        frame.healthText:SetText("")
+    end
+    if frame.healthBar and frame.healthBar.SetValue then
+        frame.healthBar:SetValue(0)
+    end
+
+    for i = 1, COTANK_MAX_ICONS do
+        ClearButton(frame.auraButtons and frame.auraButtons[i])
+    end
+
+    frame:Hide()
+end
+
+runtimeUiHelpers.ApplyCoTankFrameInteraction = function(frame)
+    if not frame or not frame.EnableMouse then
+        return
+    end
+
+    if IsInCombat() then
+        return
+    end
+
+    frame:EnableMouse(not addon.editModeActive)
+end
+
+runtimeUiHelpers.ConfigureCoTankSecureFrame = function(frame, unit)
+    if not frame then
+        return
+    end
+
+    if frame.RegisterForClicks then
+        frame:RegisterForClicks("AnyUp")
+    end
+
+    if frame.SetAttribute and not IsInCombat() then
+        frame:SetAttribute("type1", "target")
+        frame:SetAttribute("type2", "togglemenu")
+        frame:SetAttribute("unit", unit)
+    end
+
+    if ClickCastFrames then
+        ClickCastFrames[frame] = true
+    end
+
+    if unit and RegisterUnitWatch and not frame._coTankUnitWatchRegistered and not IsInCombat() then
+        RegisterUnitWatch(frame)
+        frame._coTankUnitWatchRegistered = true
+    end
+end
+
+local function CreateCoTankFrame(parent, index)
+    local frame = CreateFrame("Button", nil, parent, "SecureUnitButtonTemplate")
+    frame:SetClampedToScreen(true)
+    runtimeUiHelpers.ConfigureCoTankSecureFrame(frame, nil)
+    runtimeUiHelpers.ApplyCoTankFrameInteraction(frame)
+
+    local barFrame = CreateFrame("Frame", nil, frame)
+    frame.barFrame = barFrame
+
+    local barBg = barFrame:CreateTexture(nil, "BACKGROUND")
+    barBg:SetAllPoints()
+    barBg:SetColorTexture(0, 0, 0, 1)
+    frame.barBg = barBg
+
+    local function CreateBarBorder()
+        local border = barFrame:CreateTexture(nil, "BORDER")
+        border:SetColorTexture(0, 0, 0, 1)
+        return border
+    end
+
+    local borderTop = CreateBarBorder()
+    borderTop:SetPoint("TOPLEFT")
+    borderTop:SetPoint("TOPRIGHT")
+    borderTop:SetHeight(COTANK_BAR_STYLE.border)
+
+    local borderBottom = CreateBarBorder()
+    borderBottom:SetPoint("BOTTOMLEFT")
+    borderBottom:SetPoint("BOTTOMRIGHT")
+    borderBottom:SetHeight(COTANK_BAR_STYLE.border)
+
+    local borderLeft = CreateBarBorder()
+    borderLeft:SetPoint("TOPLEFT")
+    borderLeft:SetPoint("BOTTOMLEFT")
+    borderLeft:SetWidth(COTANK_BAR_STYLE.border)
+
+    local borderRight = CreateBarBorder()
+    borderRight:SetPoint("TOPRIGHT")
+    borderRight:SetPoint("BOTTOMRIGHT")
+    borderRight:SetWidth(COTANK_BAR_STYLE.border)
+
+    local nameText = barFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    nameText:SetPoint("LEFT", barFrame, "LEFT", COTANK_BAR_STYLE.textInset, 0)
+    if nameText.SetJustifyH then
+        nameText:SetJustifyH("LEFT")
+    end
+    if nameText.SetFont and STANDARD_TEXT_FONT then
+        nameText:SetFont(STANDARD_TEXT_FONT, 16, "OUTLINE")
+    end
+    if nameText.SetTextColor then
+        nameText:SetTextColor(1, 1, 1, 1)
+    end
+    frame.nameText = nameText
+
+    local healthText = barFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    healthText:SetPoint("RIGHT", barFrame, "RIGHT", -COTANK_BAR_STYLE.textInset, 0)
+    if healthText.SetJustifyH then
+        healthText:SetJustifyH("RIGHT")
+    end
+    if healthText.SetFont and STANDARD_TEXT_FONT then
+        healthText:SetFont(STANDARD_TEXT_FONT, 16, "OUTLINE")
+    end
+    if healthText.SetTextColor then
+        healthText:SetTextColor(1, 1, 1, 1)
+    end
+    frame.healthText = healthText
+
+    local healthBar = CreateFrame("StatusBar", nil, frame)
+    if healthBar.SetStatusBarTexture then
+        healthBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+    end
+    if healthBar.SetMinMaxValues then
+        healthBar:SetMinMaxValues(0, 1)
+    end
+    if healthBar.SetValue then
+        healthBar:SetValue(1)
+    end
+    if healthBar.SetStatusBarColor then
+        healthBar:SetStatusBarColor(0.08, 0.93, 0.62, 1)
+    end
+    frame.healthBar = healthBar
+
+    local healthBarBg = healthBar:CreateTexture(nil, "BACKGROUND")
+    healthBarBg:SetAllPoints()
+    healthBarBg:SetColorTexture(0.04, 0.16, 0.11, 0.95)
+    frame.healthBarBg = healthBarBg
+
+    frame.auraButtons = {}
+    for buttonIndex = 1, COTANK_MAX_ICONS do
+        frame.auraButtons[buttonIndex] = CreateAuraButton(frame, buttonIndex)
+    end
+
+    ApplyCoTankFrameLayout(frame, index)
+    ClearCoTankFrame(frame)
+    return frame
+end
+
+local function EnsureCoTankFrame(index)
+    if coTankFrames[index] then
+        return coTankFrames[index]
+    end
+
+    local container = EnsureCoTankContainer()
+    if not container then
+        return nil
+    end
+
+    coTankFrames[index] = CreateCoTankFrame(container, index)
+    return coTankFrames[index]
+end
+
+local function UpdateCoTankFrame(frame)
+    if not frame or not frame.unit then
+        return
+    end
+
+    UpdateCoTankHealthDisplay(frame)
+
+    local auras = ScanUnitDebuffs(frame.unit, COTANK_MAX_ICONS, "cotank")
+    for i = 1, COTANK_MAX_ICONS do
+        ApplyAuraToButton(frame.auraButtons[i], auras[i], frame.unit, "cotank")
+    end
+
+    if not frame:IsShown() and not IsInCombat() then
+        frame:Show()
+    end
+end
+
+GetCoTankFrameByUnit = function(unit)
+    if not unit then
+        return nil
+    end
+
+    for _, frame in ipairs(coTankFrames) do
+        if frame and frame.unit == unit then
+            return frame
+        end
+    end
+
+    return nil
+end
+
+RefreshCoTankFrames = function()
+    if not trackerFrame then
+        return
+    end
+
+    local layout = GetConfiguredLayoutSettings("cotank")
+    local coTankMetrics = GetCoTankFrameMetrics(layout)
+    local units = GetRaidTankUnits()
+    local container = EnsureCoTankContainer()
+    local enabled = IsCoTankFrameEnabled()
+    local deferLayout = IsInCombat()
+
+    if deferLayout then
+        addon._pendingCoTankFullRefresh = true
+
+        for _, frame in ipairs(coTankFrames) do
+            if frame and frame.unit and frame:IsShown() then
+                UpdateCoTankFrame(frame)
+            end
+        end
+
+        return
+    end
+
+    ClearTableEntries(coTankUnits)
+    if enabled then
+        for index, unit in ipairs(units) do
+            coTankUnits[index] = unit
+        end
+    end
+
+    activeCoTankCount = #coTankUnits
+
+    if container then
+        local containerHeight = activeCoTankCount > 0
+            and ((activeCoTankCount * coTankMetrics.frameHeight) + ((activeCoTankCount - 1) * COTANK_FRAME_GAP))
+            or 1
+        container:SetSize(coTankMetrics.frameWidth, containerHeight)
+        if container.anchor then
+            container.anchor:SetSize(math.max(240, coTankMetrics.frameWidth), math.max(44, coTankMetrics.barHeight))
+        end
+        if container.editOverlay then
+            container.editOverlay:SetSize(math.max(240, coTankMetrics.frameWidth), math.max(44, coTankMetrics.frameHeight))
+        end
+    end
+
+    for index, unit in ipairs(coTankUnits) do
+        local frame = EnsureCoTankFrame(index)
+        if frame then
+            frame.unit = unit
+            runtimeUiHelpers.ConfigureCoTankSecureFrame(frame, unit)
+            ApplyCoTankFrameLayout(frame, index, layout)
+            UpdateCoTankFrame(frame)
+        end
+    end
+
+    for index = activeCoTankCount + 1, #coTankFrames do
+        ClearCoTankFrame(coTankFrames[index])
+    end
+
+    if container then
+        ApplyCoTankContainerPosition()
+        if activeCoTankCount > 0 or addon.editModeActive then
+            container:Show()
+        else
+            container:Hide()
+        end
+    end
+
+    addon._pendingCoTankFullRefresh = false
+end
+
 local function CreateAnchor(parent)
     local anchor = CreateFrame("Button", nil, parent, "BackdropTemplate")
     anchor:SetPoint("TOPLEFT", 0, 0)
@@ -2046,21 +3282,249 @@ local function CreateAnchor(parent)
     anchor.borderLeft = borderLeft
     anchor.borderRight = borderRight
     anchor.settingsButton = settingsButton
-    anchor:SetScript("OnDragStart", function()
+    anchor:SetScript("OnClick", function(self)
+        local now = GetTime and GetTime() or 0
+        if self.lastDragTime and (now - self.lastDragTime) < 0.05 then
+            return
+        end
+        if addon.editModeActive and addon.OpenLayoutEditor then
+            addon:OpenLayoutEditor()
+        end
+    end)
+    anchor:SetScript("OnDragStart", function(self)
+        self.lastDragTime = nil
         if addon.editModeActive and trackerFrame and trackerFrame.StartMoving then
             trackerFrame:StartMoving()
         end
     end)
-    anchor:SetScript("OnDragStop", function()
+    anchor:SetScript("OnDragStop", function(self)
         if trackerFrame and trackerFrame.StopMovingOrSizing then
             trackerFrame:StopMovingOrSizing()
         end
+        self.lastDragTime = GetTime and GetTime() or 0
         if addon and addon.SaveTrackerPosition then
             addon:SaveTrackerPosition()
         end
     end)
     anchor:Hide()
     return anchor
+end
+
+local function CreateCoTankAnchor(parent)
+    local metrics = GetCoTankFrameMetrics(GetConfiguredLayoutSettings("cotank"))
+    local anchor = CreateFrame("Button", nil, parent, "BackdropTemplate")
+    anchor:SetPoint("TOPLEFT", 0, 0)
+    anchor:SetSize(math.max(240, metrics.frameWidth), math.max(44, metrics.barHeight))
+    anchor:EnableMouse(false)
+    anchor:RegisterForDrag("LeftButton")
+
+    local bg = anchor:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0, 0, 0, 0)
+
+    local function CreateBorder()
+        local border = anchor:CreateTexture(nil, "BORDER")
+        border:SetColorTexture(0, 0, 0, 0)
+        return border
+    end
+
+    local borderTop = CreateBorder()
+    borderTop:SetPoint("TOPLEFT")
+    borderTop:SetPoint("TOPRIGHT")
+    borderTop:SetHeight(2)
+
+    local borderBottom = CreateBorder()
+    borderBottom:SetPoint("BOTTOMLEFT")
+    borderBottom:SetPoint("BOTTOMRIGHT")
+    borderBottom:SetHeight(2)
+
+    local borderLeft = CreateBorder()
+    borderLeft:SetPoint("TOPLEFT")
+    borderLeft:SetPoint("BOTTOMLEFT")
+    borderLeft:SetWidth(2)
+
+    local borderRight = CreateBorder()
+    borderRight:SetPoint("TOPRIGHT")
+    borderRight:SetPoint("BOTTOMRIGHT")
+    borderRight:SetWidth(2)
+
+    anchor:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 12,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+    anchor:SetBackdropColor(0, 0, 0, 0)
+    anchor:SetBackdropBorderColor(0, 0, 0, 0)
+
+    local label = anchor:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    label:SetPoint("LEFT", 14, 0)
+    label:SetText("|cff00ccffCo-Tank Frames|r")
+
+    local settingsButton = CreateFrame("Button", nil, anchor, "UIPanelButtonTemplate")
+    settingsButton:SetSize(62, 20)
+    settingsButton:SetPoint("RIGHT", -10, 0)
+    settingsButton:SetText("Layout")
+    settingsButton:SetScript("OnClick", function()
+        if addon.editModeActive and addon.OpenLayoutEditor then
+            addon:OpenLayoutEditor("cotank")
+        end
+    end)
+
+    anchor.allTex = { bg, borderTop, borderBottom, borderLeft, borderRight }
+    anchor.bg = bg
+    anchor.label = label
+    anchor.borderTop = borderTop
+    anchor.borderBottom = borderBottom
+    anchor.borderLeft = borderLeft
+    anchor.borderRight = borderRight
+    anchor.settingsButton = settingsButton
+    anchor:SetScript("OnClick", function(self)
+        local now = GetTime and GetTime() or 0
+        if self.lastDragTime and (now - self.lastDragTime) < 0.05 then
+            return
+        end
+        if addon.editModeActive and addon.OpenLayoutEditor then
+            addon:OpenLayoutEditor("cotank")
+        end
+    end)
+    anchor:SetScript("OnDragStart", function(self)
+        self.lastDragTime = nil
+        if addon.editModeActive and coTankContainer and coTankContainer.StartMoving then
+            coTankDragActive = true
+            coTankContainer:StartMoving()
+        end
+    end)
+    anchor:SetScript("OnDragStop", function(self)
+        if coTankContainer and coTankContainer.StopMovingOrSizing then
+            coTankContainer:StopMovingOrSizing()
+        end
+        coTankDragActive = false
+        self.lastDragTime = GetTime and GetTime() or 0
+        if addon and addon.SaveCoTankPosition then
+            addon:SaveCoTankPosition()
+        end
+    end)
+    anchor:Hide()
+    return anchor
+end
+
+function addon:CreateCoTankEditModeOverlay()
+    local metrics = GetCoTankFrameMetrics(GetConfiguredLayoutSettings("cotank"))
+    local overlay = CreateFrame("Frame", nil, coTankContainer, "BackdropTemplate")
+    overlay:SetPoint("TOPLEFT", 0, 0)
+    overlay:SetSize(math.max(240, metrics.frameWidth), math.max(44, metrics.frameHeight))
+    if coTankContainer.GetFrameLevel and overlay.SetFrameLevel then
+        overlay:SetFrameLevel(coTankContainer:GetFrameLevel() + 5)
+    end
+
+    overlay:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 12,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+    overlay:SetBackdropColor(0.42, 0.56, 0.58, 0)
+    overlay:SetBackdropBorderColor(0.84, 0.92, 0.92, 0)
+
+    local bg = overlay:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0, 0, 0, 0)
+    overlay.bg = bg
+
+    local function CreateBorder()
+        local border = overlay:CreateTexture(nil, "BORDER")
+        border:SetColorTexture(0.90, 0.96, 0.96, 0)
+        return border
+    end
+
+    local borderTop = CreateBorder()
+    borderTop:SetPoint("TOPLEFT")
+    borderTop:SetPoint("TOPRIGHT")
+    borderTop:SetHeight(2)
+
+    local borderBottom = CreateBorder()
+    borderBottom:SetPoint("BOTTOMLEFT")
+    borderBottom:SetPoint("BOTTOMRIGHT")
+    borderBottom:SetHeight(2)
+
+    local borderLeft = CreateBorder()
+    borderLeft:SetPoint("TOPLEFT")
+    borderLeft:SetPoint("BOTTOMLEFT")
+    borderLeft:SetWidth(2)
+
+    local borderRight = CreateBorder()
+    borderRight:SetPoint("TOPRIGHT")
+    borderRight:SetPoint("BOTTOMRIGHT")
+    borderRight:SetWidth(2)
+
+    local barFrame = CreateFrame("Frame", nil, overlay)
+    barFrame:SetPoint("TOPLEFT", 0, 0)
+    barFrame:SetSize(metrics.barWidth, metrics.barHeight)
+    overlay.previewBarFrame = barFrame
+
+    local barFrameBg = barFrame:CreateTexture(nil, "BACKGROUND")
+    barFrameBg:SetAllPoints()
+    barFrameBg:SetColorTexture(0, 0, 0, 0.65)
+
+    local function CreatePreviewBorder()
+        local border = barFrame:CreateTexture(nil, "BORDER")
+        border:SetColorTexture(0.90, 0.96, 0.96, 0.22)
+        return border
+    end
+
+    local previewTop = CreatePreviewBorder()
+    previewTop:SetPoint("TOPLEFT")
+    previewTop:SetPoint("TOPRIGHT")
+    previewTop:SetHeight(COTANK_BAR_STYLE.border)
+
+    local previewBottom = CreatePreviewBorder()
+    previewBottom:SetPoint("BOTTOMLEFT")
+    previewBottom:SetPoint("BOTTOMRIGHT")
+    previewBottom:SetHeight(COTANK_BAR_STYLE.border)
+
+    local previewLeft = CreatePreviewBorder()
+    previewLeft:SetPoint("TOPLEFT")
+    previewLeft:SetPoint("BOTTOMLEFT")
+    previewLeft:SetWidth(COTANK_BAR_STYLE.border)
+
+    local previewRight = CreatePreviewBorder()
+    previewRight:SetPoint("TOPRIGHT")
+    previewRight:SetPoint("BOTTOMRIGHT")
+    previewRight:SetWidth(COTANK_BAR_STYLE.border)
+
+    local bar = overlay:CreateTexture(nil, "ARTWORK")
+    bar:SetPoint("TOPLEFT", barFrame, "TOPLEFT", COTANK_BAR_STYLE.border, -COTANK_BAR_STYLE.border)
+    bar:SetPoint("BOTTOMRIGHT", barFrame, "BOTTOMRIGHT", -COTANK_BAR_STYLE.border, COTANK_BAR_STYLE.border)
+    bar:SetColorTexture(0.08, 0.93, 0.62, 0.45)
+    overlay.previewBar = bar
+
+    overlay.previewIcons = {}
+    for index, textureID in ipairs(EDIT_PREVIEW_ICONS) do
+        local icon = overlay:CreateTexture(nil, "ARTWORK")
+        icon:SetSize(16, 16)
+        icon:SetPoint("TOPLEFT", 0 + ((index - 1) * 18), -(metrics.iconRowOffset + 2))
+        icon:SetTexture(textureID)
+        icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        icon:SetAlpha(0)
+        overlay.previewIcons[index] = icon
+    end
+
+    local label = overlay:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    label:SetPoint("LEFT", barFrame, "LEFT", COTANK_BAR_STYLE.textInset, 0)
+    if label.SetFont and STANDARD_TEXT_FONT then
+        label:SetFont(STANDARD_TEXT_FONT, 16, "OUTLINE")
+    end
+    label:SetText("")
+
+    overlay.allTex = { bg, borderTop, borderBottom, borderLeft, borderRight }
+    overlay.label = label
+    overlay.borderTop = borderTop
+    overlay.borderBottom = borderBottom
+    overlay.borderLeft = borderLeft
+    overlay.borderRight = borderRight
+    overlay:Hide()
+    coTankContainer.editOverlay = overlay
 end
 
 function addon:CreateEditModeOverlay()
@@ -2145,15 +3609,6 @@ function addon:CreateEditModeOverlay()
     overlay.borderRight = borderRight
     overlay:Hide()
     trackerFrame.editOverlay = overlay
-end
-
-local function CloneBorderColor(color)
-    color = type(color) == "table" and color or {}
-    return {
-        r = tonumber(color.r) or 0,
-        g = tonumber(color.g) or 0,
-        b = tonumber(color.b) or 0,
-    }
 end
 
 local function CreateEditorWrappedText(parent, text, width)
@@ -2260,6 +3715,49 @@ local function GetLayoutEditorPreviewBorderColor(state)
     return tonumber(color.r) or 0, tonumber(color.g) or 0, tonumber(color.b) or 0
 end
 
+local function GetLayoutEditorTargetKey()
+    return layoutEditorFrame and GetLayoutTargetKey(layoutEditorFrame.targetKey) or "tracker"
+end
+
+local function UpdateLayoutEditorChrome()
+    if not layoutEditorFrame then
+        return
+    end
+
+    local targetKey = GetLayoutEditorTargetKey()
+    if layoutEditorFrame.titleText then
+        if targetKey == "cotank" then
+            layoutEditorFrame.titleText:SetText("|cff00ccffDebuff Tracker|r Co-Tank Layout")
+        else
+            layoutEditorFrame.titleText:SetText("|cff00ccffDebuff Tracker|r Layout")
+        end
+    end
+
+    if layoutEditorFrame.subtitleText then
+        if targetKey == "cotank" then
+            layoutEditorFrame.subtitleText:SetText("Open this from the Co-Tank Edit Mode anchor. Adjust health bar width, height, solid colors, text size, plus debuff icon styling.")
+        else
+            layoutEditorFrame.subtitleText:SetText("Open this from Edit Mode. Drag the left edge to widen and the top edge to increase height.")
+        end
+    end
+
+    if layoutEditorFrame.previewHint then
+        if targetKey == "cotank" then
+            layoutEditorFrame.previewHint:SetText("Preview shows a co-tank health bar plus one debuff icon. Use the bar controls on the right for width, height, text size, and colors. Drag 2 / 8.8 to reposition debuff text.")
+        else
+            layoutEditorFrame.previewHint:SetText("Drag the left edge for width, the top edge for height, and drag 2 / 8.8 to reposition text")
+        end
+    end
+
+    if layoutEditorFrame.previewHealthBar then
+        if targetKey == "cotank" then
+            layoutEditorFrame.previewHealthBar:Show()
+        else
+            layoutEditorFrame.previewHealthBar:Hide()
+        end
+    end
+end
+
 local function SetLayoutEditorControlsShown(controls, shown)
     if not controls then
         return
@@ -2281,6 +3779,9 @@ local function RefreshLayoutEditorPreview()
         return
     end
 
+    UpdateLayoutEditorChrome()
+
+    local targetKey = GetLayoutEditorTargetKey()
     local state = layoutEditorFrame.state
     local layout = state.layout
     local iconWidth = ClampIconDimension(layout.iconWidth)
@@ -2299,6 +3800,17 @@ local function RefreshLayoutEditorPreview()
     end
     if layoutEditorFrame.borderThicknessInput then
         layoutEditorFrame.borderThicknessInput:SetText(tostring(borderThickness))
+    end
+    if targetKey == "cotank" then
+        if layoutEditorFrame.coTankFrameWidthInput then
+            layoutEditorFrame.coTankFrameWidthInput:SetText(tostring(ClampCoTankFrameWidth(layout.frameWidth)))
+        end
+        if layoutEditorFrame.coTankBarHeightInput then
+            layoutEditorFrame.coTankBarHeightInput:SetText(tostring(ClampCoTankBarHeight(layout.barHeight)))
+        end
+        if layoutEditorFrame.coTankBarTextSizeInput then
+            layoutEditorFrame.coTankBarTextSizeInput:SetText(tostring(ClampFontSize(layout.barTextFontSize or 16)))
+        end
     end
 
     if layoutEditorFrame.previewGroup then
@@ -2364,6 +3876,39 @@ local function RefreshLayoutEditorPreview()
     if layoutEditorFrame.previewBorderRight then layoutEditorFrame.previewBorderRight:SetColorTexture(r, g, b, 1) end
     ApplyBorderThickness(layoutEditorFrame.previewGroup, borderThickness)
 
+    if layoutEditorFrame.previewHealthBarFrame and layoutEditorFrame.previewHealthBar then
+        if targetKey == "cotank" then
+            local metrics = GetCoTankFrameMetrics(layout)
+            local fillColor = CloneBorderColor(layout.barFillColor)
+            local bgColor = CloneBorderColor(layout.barBackgroundColor)
+            local fillR, fillG, fillB = fillColor.r, fillColor.g, fillColor.b
+            local bgR, bgG, bgB = bgColor.r, bgColor.g, bgColor.b
+            local fontSize = ClampFontSize(layout.barTextFontSize or 16)
+            layoutEditorFrame.previewHealthBarFrame:Show()
+            layoutEditorFrame.previewHealthBarFrame:ClearAllPoints()
+            layoutEditorFrame.previewHealthBarFrame:SetPoint("TOPLEFT", layoutEditorFrame.previewArea, "TOPLEFT", 24, -34)
+            layoutEditorFrame.previewHealthBarFrame:SetSize(metrics.barWidth, metrics.barHeight)
+            layoutEditorFrame.previewHealthBar:SetStatusBarColor(fillR, fillG, fillB, 1)
+            if layoutEditorFrame.previewHealthBarBg then
+                layoutEditorFrame.previewHealthBarBg:SetColorTexture(bgR, bgG, bgB, 0.95)
+            end
+            if layoutEditorFrame.previewHealthName and layoutEditorFrame.previewHealthName.SetFont and STANDARD_TEXT_FONT then
+                layoutEditorFrame.previewHealthName:SetFont(STANDARD_TEXT_FONT, fontSize, "OUTLINE")
+                layoutEditorFrame.previewHealthName:SetText("Wisently")
+            end
+            if layoutEditorFrame.previewHealthValue and layoutEditorFrame.previewHealthValue.SetFont and STANDARD_TEXT_FONT then
+                layoutEditorFrame.previewHealthValue:SetFont(STANDARD_TEXT_FONT, fontSize, "OUTLINE")
+                layoutEditorFrame.previewHealthValue:SetText("100%")
+            end
+            layoutEditorFrame.previewGroup:ClearAllPoints()
+            layoutEditorFrame.previewGroup:SetPoint("TOPLEFT", layoutEditorFrame.previewHealthBarFrame, "BOTTOMLEFT", 0, -COTANK_BAR_STYLE.iconGap)
+        else
+            layoutEditorFrame.previewHealthBarFrame:Hide()
+            layoutEditorFrame.previewGroup:ClearAllPoints()
+            layoutEditorFrame.previewGroup:SetPoint("BOTTOMRIGHT", layoutEditorFrame.previewArea, "CENTER", 42, -18)
+        end
+    end
+
     if layoutEditorFrame.customModeButton then
         layoutEditorFrame.customModeButton:SetSelected(state.borderMode ~= "blizzard")
     end
@@ -2380,10 +3925,21 @@ local function RefreshLayoutEditorPreview()
             math.floor(((tonumber(customColor.g) or 0) * 255) + 0.5),
             math.floor(((tonumber(customColor.b) or 0) * 255) + 0.5)))
     end
+    if targetKey == "cotank" then
+        local fillColor = CloneBorderColor(layout.barFillColor)
+        local bgColor = CloneBorderColor(layout.barBackgroundColor)
+        if layoutEditorFrame.coTankFillPreview then
+            layoutEditorFrame.coTankFillPreview:SetColorTexture(fillColor.r, fillColor.g, fillColor.b, 1)
+        end
+        if layoutEditorFrame.coTankBgPreview then
+            layoutEditorFrame.coTankBgPreview:SetColorTexture(bgColor.r, bgColor.g, bgColor.b, 1)
+        end
+    end
 
     SetLayoutEditorControlsShown(layoutEditorFrame.iconControls, selectedElementKey == "icon")
     SetLayoutEditorControlsShown(layoutEditorFrame.textControls, selectedElementKey ~= "icon")
     SetLayoutEditorControlsShown(layoutEditorFrame.customColorControls, selectedElementKey == "icon" and state.borderMode ~= "blizzard")
+    SetLayoutEditorControlsShown(layoutEditorFrame.coTankAppearanceControls, targetKey == "cotank")
 end
 
 local function SelectLayoutEditorIcon()
@@ -2413,6 +3969,7 @@ local function AdjustSelectedLayoutFontSize(delta)
     local layout = layoutEditorFrame.state.layout
     local fontKey = layoutEditorFrame.selectedTextKey == "duration" and "durationFontSize" or "countFontSize"
     layout[fontKey] = ClampFontSize((layout[fontKey] or 14) + delta)
+    runtimeUiHelpers.MarkLayoutEditorDirty()
     RefreshLayoutEditorPreview()
 end
 
@@ -2438,6 +3995,7 @@ local function BeginLayoutHandleDrag(handle, offsetXKey, offsetYKey)
         local deltaY = (nextCursorY / frameScale) - self.dragStartCursorY
         layoutEditorFrame.state.layout[self.offsetXKey] = math.floor(self.dragStartOffsetX + deltaX + 0.5)
         layoutEditorFrame.state.layout[self.offsetYKey] = math.floor(self.dragStartOffsetY + deltaY + 0.5)
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end)
 end
@@ -2481,11 +4039,12 @@ local function BeginLayoutResizeDrag(handle, widthKey, heightKey, directionX, di
             local nextHeight = self.dragStartHeight + (deltaY * self.directionY)
             layoutEditorFrame.state.layout[self.heightKey] = ClampIconDimension(nextHeight)
         end
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end)
 end
 
-local function OpenLayoutEditorColorPicker()
+local function OpenLayoutEditorColorPicker(colorTarget)
     if not layoutEditorFrame or not layoutEditorFrame.state then
         return
     end
@@ -2494,7 +4053,11 @@ local function OpenLayoutEditorColorPicker()
         return
     end
 
-    local current = CloneBorderColor(layoutEditorFrame.state.customBorderColor)
+    local usingLayoutColor = colorTarget == "barFillColor" or colorTarget == "barBackgroundColor"
+    local current = usingLayoutColor
+        and CloneBorderColor(layoutEditorFrame.state.layout[colorTarget])
+        or CloneBorderColor(layoutEditorFrame.state.customBorderColor)
+
     ColorPickerFrame:SetupColorPickerAndShow({
         r = current.r,
         g = current.g,
@@ -2502,12 +4065,21 @@ local function OpenLayoutEditorColorPicker()
         hasOpacity = false,
         swatchFunc = function()
             local r, g, b = ColorPickerFrame:GetColorRGB()
-            layoutEditorFrame.state.borderMode = "custom"
-            layoutEditorFrame.state.customBorderColor = { r = r, g = g, b = b }
+            if usingLayoutColor then
+                layoutEditorFrame.state.layout[colorTarget] = { r = r, g = g, b = b }
+            else
+                layoutEditorFrame.state.borderMode = "custom"
+                layoutEditorFrame.state.customBorderColor = { r = r, g = g, b = b }
+            end
+            runtimeUiHelpers.MarkLayoutEditorDirty()
             RefreshLayoutEditorPreview()
         end,
         cancelFunc = function()
-            layoutEditorFrame.state.customBorderColor = current
+            if usingLayoutColor then
+                layoutEditorFrame.state.layout[colorTarget] = current
+            else
+                layoutEditorFrame.state.customBorderColor = current
+            end
             RefreshLayoutEditorPreview()
         end,
     })
@@ -2518,12 +4090,15 @@ local function CommitLayoutEditorState()
         return
     end
 
-    addon.db.layout = CloneLayoutSettings(layoutEditorFrame.state.layout)
-    addon.db.borderMode = layoutEditorFrame.state.borderMode
-    addon.db.customBorderColor = CloneBorderColor(layoutEditorFrame.state.customBorderColor)
+    local targetKey = GetLayoutEditorTargetKey()
+    addon.db[GetLayoutDbKey(targetKey)] = CloneLayoutSettings(layoutEditorFrame.state.layout, targetKey)
+    addon.db[GetBorderModeDbKey(targetKey)] = layoutEditorFrame.state.borderMode
+    addon.db[GetBorderColorDbKey(targetKey)] = CloneBorderColor(layoutEditorFrame.state.customBorderColor)
 
     RefreshTrackerLayout()
     addon:UpdateTrackedAuras("layout-editor-apply")
+    layoutEditorFrame.hasPendingChanges = false
+    layoutEditorFrame.discardChangesOnHide = false
 end
 
 local function ResetLayoutEditorState()
@@ -2531,24 +4106,31 @@ local function ResetLayoutEditorState()
         return
     end
 
+    local targetKey = GetLayoutEditorTargetKey()
     layoutEditorFrame.state = {
-        layout = GetDefaultLayoutSettings(),
+        layout = GetDefaultLayoutSettings(targetKey),
         borderMode = "custom",
         customBorderColor = { r = 0, g = 0, b = 0 },
     }
     layoutEditorFrame.selectedElementKey = "icon"
     layoutEditorFrame.selectedTextKey = "count"
+    runtimeUiHelpers.MarkLayoutEditorDirty()
     RefreshLayoutEditorPreview()
 end
 
-local function LoadLayoutEditorState()
+local function LoadLayoutEditorState(targetKey)
+    targetKey = GetLayoutTargetKey(targetKey or GetLayoutEditorTargetKey())
+    layoutEditorFrame.targetKey = targetKey
     layoutEditorFrame.state = {
-        layout = CloneLayoutSettings(GetConfiguredLayoutSettings()),
-        borderMode = addon and addon.db and addon.db.borderMode or "custom",
-        customBorderColor = CloneBorderColor(addon and addon.db and addon.db.customBorderColor or nil),
+        layout = CloneLayoutSettings(GetConfiguredLayoutSettings(targetKey), targetKey),
+        borderMode = addon and addon.db and addon.db[GetBorderModeDbKey(targetKey)] or "custom",
+        customBorderColor = CloneBorderColor(addon and addon.db and addon.db[GetBorderColorDbKey(targetKey)] or nil),
     }
     layoutEditorFrame.selectedElementKey = layoutEditorFrame.selectedElementKey or "icon"
     layoutEditorFrame.selectedTextKey = layoutEditorFrame.selectedTextKey or "count"
+    layoutEditorFrame.hasPendingChanges = false
+    layoutEditorFrame.discardChangesOnHide = false
+    UpdateLayoutEditorChrome()
 end
 
 local function CreateLayoutHandle(parent, text)
@@ -2608,13 +4190,212 @@ local function CreateLayoutHandle(parent, text)
     return handle
 end
 
+local function CreateLayoutEditorPreviewHealthBar(frame, previewArea)
+    local previewHealthBarFrame = CreateFrame("Frame", nil, previewArea)
+    previewHealthBarFrame:SetPoint("TOPLEFT", previewArea, "TOPLEFT", 24, -34)
+    previewHealthBarFrame:SetSize(252, 44)
+    frame.previewHealthBarFrame = previewHealthBarFrame
+
+    local previewHealthBarFrameBg = previewHealthBarFrame:CreateTexture(nil, "BACKGROUND")
+    previewHealthBarFrameBg:SetAllPoints()
+    previewHealthBarFrameBg:SetColorTexture(0, 0, 0, 1)
+
+    local function CreatePreviewHealthBorder()
+        local border = previewHealthBarFrame:CreateTexture(nil, "BORDER")
+        border:SetColorTexture(0, 0, 0, 1)
+        return border
+    end
+
+    local previewHealthTop = CreatePreviewHealthBorder()
+    previewHealthTop:SetPoint("TOPLEFT")
+    previewHealthTop:SetPoint("TOPRIGHT")
+    previewHealthTop:SetHeight(COTANK_BAR_STYLE.border)
+
+    local previewHealthBottom = CreatePreviewHealthBorder()
+    previewHealthBottom:SetPoint("BOTTOMLEFT")
+    previewHealthBottom:SetPoint("BOTTOMRIGHT")
+    previewHealthBottom:SetHeight(COTANK_BAR_STYLE.border)
+
+    local previewHealthLeft = CreatePreviewHealthBorder()
+    previewHealthLeft:SetPoint("TOPLEFT")
+    previewHealthLeft:SetPoint("BOTTOMLEFT")
+    previewHealthLeft:SetWidth(COTANK_BAR_STYLE.border)
+
+    local previewHealthRight = CreatePreviewHealthBorder()
+    previewHealthRight:SetPoint("TOPRIGHT")
+    previewHealthRight:SetPoint("BOTTOMRIGHT")
+    previewHealthRight:SetWidth(COTANK_BAR_STYLE.border)
+
+    local previewHealthBar = CreateFrame("StatusBar", nil, previewHealthBarFrame)
+    previewHealthBar:SetPoint("TOPLEFT", previewHealthBarFrame, "TOPLEFT", COTANK_BAR_STYLE.border, -COTANK_BAR_STYLE.border)
+    previewHealthBar:SetPoint("BOTTOMRIGHT", previewHealthBarFrame, "BOTTOMRIGHT", -COTANK_BAR_STYLE.border, COTANK_BAR_STYLE.border)
+    if previewHealthBar.SetStatusBarTexture then
+        previewHealthBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+    end
+    if previewHealthBar.SetMinMaxValues then
+        previewHealthBar:SetMinMaxValues(0, 100)
+    end
+    if previewHealthBar.SetValue then
+        previewHealthBar:SetValue(100)
+    end
+    if previewHealthBar.SetStatusBarColor then
+        previewHealthBar:SetStatusBarColor(0.08, 0.93, 0.62, 1)
+    end
+    local previewHealthBarBg = previewHealthBar:CreateTexture(nil, "BACKGROUND")
+    previewHealthBarBg:SetAllPoints()
+    previewHealthBarBg:SetColorTexture(0.04, 0.16, 0.11, 0.95)
+    frame.previewHealthBar = previewHealthBar
+    frame.previewHealthBarBg = previewHealthBarBg
+
+    local previewHealthName = previewHealthBarFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    previewHealthName:SetPoint("LEFT", previewHealthBarFrame, "LEFT", COTANK_BAR_STYLE.textInset, 0)
+    previewHealthName:SetText("Wisently")
+    frame.previewHealthName = previewHealthName
+
+    local previewHealthValue = previewHealthBarFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    previewHealthValue:SetPoint("RIGHT", previewHealthBarFrame, "RIGHT", -COTANK_BAR_STYLE.textInset, 0)
+    previewHealthValue:SetText("100%")
+    frame.previewHealthValue = previewHealthValue
+
+    previewHealthBar:Hide()
+    previewHealthBarFrame:Hide()
+end
+
+local function CreateLayoutEditorCoTankControls(frame, controls, TrackControl)
+    local coTankAppearanceLabel = controls:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    coTankAppearanceLabel:SetPoint("TOPLEFT", 14, -434)
+    coTankAppearanceLabel:SetText("Co-Tank Bar")
+    TrackControl(coTankAppearanceLabel, "coTankAppearanceControls")
+
+    local coTankWidthLabel = controls:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    coTankWidthLabel:SetPoint("TOPLEFT", 14, -456)
+    coTankWidthLabel:SetText("Width")
+    TrackControl(coTankWidthLabel, "coTankAppearanceControls")
+
+    local coTankWidthInput = CreateFrame("EditBox", nil, controls, "InputBoxTemplate")
+    coTankWidthInput:SetSize(48, 22)
+    coTankWidthInput:SetPoint("TOPLEFT", 14, -476)
+    coTankWidthInput:SetAutoFocus(false)
+    coTankWidthInput:SetNumeric(true)
+    frame.coTankFrameWidthInput = coTankWidthInput
+    TrackControl(coTankWidthInput, "coTankAppearanceControls")
+
+    local coTankHeightLabel = controls:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    coTankHeightLabel:SetPoint("TOPLEFT", 78, -456)
+    coTankHeightLabel:SetText("Height")
+    TrackControl(coTankHeightLabel, "coTankAppearanceControls")
+
+    local coTankHeightInput = CreateFrame("EditBox", nil, controls, "InputBoxTemplate")
+    coTankHeightInput:SetSize(48, 22)
+    coTankHeightInput:SetPoint("TOPLEFT", 78, -476)
+    coTankHeightInput:SetAutoFocus(false)
+    coTankHeightInput:SetNumeric(true)
+    frame.coTankBarHeightInput = coTankHeightInput
+    TrackControl(coTankHeightInput, "coTankAppearanceControls")
+
+    local coTankTextSizeLabel = controls:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    coTankTextSizeLabel:SetPoint("TOPLEFT", 142, -456)
+    coTankTextSizeLabel:SetText("Text")
+    TrackControl(coTankTextSizeLabel, "coTankAppearanceControls")
+
+    local coTankTextSizeInput = CreateFrame("EditBox", nil, controls, "InputBoxTemplate")
+    coTankTextSizeInput:SetSize(48, 22)
+    coTankTextSizeInput:SetPoint("TOPLEFT", 142, -476)
+    coTankTextSizeInput:SetAutoFocus(false)
+    coTankTextSizeInput:SetNumeric(true)
+    frame.coTankBarTextSizeInput = coTankTextSizeInput
+    TrackControl(coTankTextSizeInput, "coTankAppearanceControls")
+
+    local function ApplyManualCoTankBarSettings()
+        if not frame.state then
+            return
+        end
+
+        frame.state.layout.frameWidth = ClampCoTankFrameWidth(coTankWidthInput:GetText())
+        frame.state.layout.barHeight = ClampCoTankBarHeight(coTankHeightInput:GetText())
+        frame.state.layout.barTextFontSize = ClampFontSize(coTankTextSizeInput:GetText())
+        runtimeUiHelpers.MarkLayoutEditorDirty()
+        RefreshLayoutEditorPreview()
+    end
+
+    coTankWidthInput:SetScript("OnEnterPressed", function(self)
+        ApplyManualCoTankBarSettings()
+        self:ClearFocus()
+    end)
+    coTankHeightInput:SetScript("OnEnterPressed", function(self)
+        ApplyManualCoTankBarSettings()
+        self:ClearFocus()
+    end)
+    coTankTextSizeInput:SetScript("OnEnterPressed", function(self)
+        ApplyManualCoTankBarSettings()
+        self:ClearFocus()
+    end)
+
+    local coTankApplySizeButton = CreateEditorButton(controls, 52, 22, "Set")
+    coTankApplySizeButton:SetPoint("TOPLEFT", 204, -476)
+    coTankApplySizeButton:SetScript("OnClick", ApplyManualCoTankBarSettings)
+    TrackControl(coTankApplySizeButton, "coTankAppearanceControls")
+
+    local coTankFillButton = CreateEditorButton(controls, 92, 22, "Fill Color")
+    coTankFillButton:SetPoint("TOPLEFT", 14, -514)
+    coTankFillButton:SetScript("OnClick", function()
+        OpenLayoutEditorColorPicker("barFillColor")
+    end)
+    TrackControl(coTankFillButton, "coTankAppearanceControls")
+
+    local coTankFillPreview = CreateFrame("Frame", nil, controls, "BackdropTemplate")
+    coTankFillPreview:SetSize(24, 22)
+    coTankFillPreview:SetPoint("LEFT", coTankFillButton, "RIGHT", 8, 0)
+    coTankFillPreview:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 10,
+        insets = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    local coTankFillPreviewTex = coTankFillPreview:CreateTexture(nil, "ARTWORK")
+    coTankFillPreviewTex:SetPoint("TOPLEFT", 3, -3)
+    coTankFillPreviewTex:SetPoint("BOTTOMRIGHT", -3, 3)
+    frame.coTankFillPreview = coTankFillPreviewTex
+    TrackControl(coTankFillPreview, "coTankAppearanceControls")
+
+    local coTankBgButton = CreateEditorButton(controls, 96, 22, "Bar BG")
+    coTankBgButton:SetPoint("TOPLEFT", 136, -514)
+    coTankBgButton:SetScript("OnClick", function()
+        OpenLayoutEditorColorPicker("barBackgroundColor")
+    end)
+    TrackControl(coTankBgButton, "coTankAppearanceControls")
+
+    local coTankBgPreview = CreateFrame("Frame", nil, controls, "BackdropTemplate")
+    coTankBgPreview:SetSize(24, 22)
+    coTankBgPreview:SetPoint("LEFT", coTankBgButton, "RIGHT", 8, 0)
+    coTankBgPreview:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 10,
+        insets = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    local coTankBgPreviewTex = coTankBgPreview:CreateTexture(nil, "ARTWORK")
+    coTankBgPreviewTex:SetPoint("TOPLEFT", 3, -3)
+    coTankBgPreviewTex:SetPoint("BOTTOMRIGHT", -3, 3)
+    frame.coTankBgPreview = coTankBgPreviewTex
+    TrackControl(coTankBgPreview, "coTankAppearanceControls")
+
+    local coTankAppearanceHelp = CreateEditorWrappedText(
+        controls,
+        "These settings control the co-tank health bar width, height, text size, and solid colors from Edit Mode.",
+        226
+    )
+    coTankAppearanceHelp:SetPoint("TOPLEFT", 14, -548)
+    TrackControl(coTankAppearanceHelp, "coTankAppearanceControls")
+end
+
 function addon:CreateLayoutEditor()
     if layoutEditorFrame then
         return layoutEditorFrame
     end
 
     local frame = CreateFrame("Frame", "DebuffTrackLayoutEditorFrame", UIParent, "BackdropTemplate")
-    frame:SetSize(720, 540)
+    frame:SetSize(720, 620)
     frame:SetPoint("CENTER")
     frame:SetFrameStrata("DIALOG")
     frame:SetClampedToScreen(true)
@@ -2636,17 +4417,19 @@ function addon:CreateLayoutEditor()
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 18, -16)
     title:SetText("|cff00ccffDebuff Tracker|r Layout")
+    frame.titleText = title
 
     local subtitle = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     subtitle:SetPoint("TOPLEFT", 18, -38)
     subtitle:SetText("Open this from Edit Mode. Drag the left edge to widen and the top edge to increase height.")
+    frame.subtitleText = subtitle
 
     local closeButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     closeButton:SetPoint("TOPRIGHT", -4, -4)
 
     local previewArea = CreateFrame("Frame", nil, frame, "BackdropTemplate")
     previewArea:SetPoint("TOPLEFT", 18, -66)
-    previewArea:SetSize(410, 320)
+    previewArea:SetSize(410, 360)
     previewArea:SetBackdrop({
         bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
         edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -2655,13 +4438,16 @@ function addon:CreateLayoutEditor()
     })
     previewArea:SetBackdropColor(0.07, 0.07, 0.08, 0.94)
     previewArea:SetBackdropBorderColor(0.22, 0.22, 0.24, 1)
+    frame.previewArea = previewArea
 
     local previewHint = previewArea:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     previewHint:SetPoint("BOTTOM", 0, 14)
     previewHint:SetText("Drag the left edge for width, the top edge for height, and drag 2 / 8.8 to reposition text")
+    frame.previewHint = previewHint
+    CreateLayoutEditorPreviewHealthBar(frame, previewArea)
 
     local previewGroup = CreateFrame("Frame", nil, previewArea)
-    previewGroup:SetPoint("BOTTOMRIGHT", previewArea, "CENTER", 42, -18)
+    previewGroup:SetPoint("TOPLEFT", previewHealthBarFrame, "BOTTOMLEFT", 0, -COTANK_BAR_STYLE.iconGap)
     previewGroup:SetSize(72, 72)
     previewGroup:EnableMouse(true)
     previewGroup:SetScript("OnMouseDown", function()
@@ -2749,7 +4535,7 @@ function addon:CreateLayoutEditor()
 
     local controls = CreateFrame("Frame", nil, frame, "BackdropTemplate")
     controls:SetPoint("TOPRIGHT", -18, -66)
-    controls:SetSize(256, 430)
+    controls:SetSize(256, 510)
     controls:SetBackdrop({
         bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
         edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -2761,6 +4547,7 @@ function addon:CreateLayoutEditor()
     frame.iconControls = {}
     frame.textControls = {}
     frame.customColorControls = {}
+    frame.coTankAppearanceControls = {}
 
     local function TrackControl(control, groupName)
         if not control or not groupName then
@@ -2823,6 +4610,7 @@ function addon:CreateLayoutEditor()
 
         frame.state.layout.iconWidth = ClampIconDimension(widthInput:GetText())
         frame.state.layout.iconHeight = ClampIconDimension(heightInput:GetText())
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end
 
@@ -2864,6 +4652,7 @@ function addon:CreateLayoutEditor()
             return
         end
         frame.state.layout.borderThickness = ClampBorderThickness((frame.state.layout.borderThickness or 2) - 1)
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end)
     TrackControl(borderThicknessMinus, "iconControls")
@@ -2875,6 +4664,7 @@ function addon:CreateLayoutEditor()
             return
         end
         frame.state.layout.borderThickness = ClampBorderThickness((frame.state.layout.borderThickness or 2) + 1)
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end)
     TrackControl(borderThicknessPlus, "iconControls")
@@ -2886,6 +4676,7 @@ function addon:CreateLayoutEditor()
             return
         end
         frame.state.layout.borderThickness = ClampBorderThickness(borderThicknessInput:GetText())
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end)
     TrackControl(borderThicknessApply, "iconControls")
@@ -2941,6 +4732,7 @@ function addon:CreateLayoutEditor()
         end
         local fontKey = frame.selectedTextKey == "duration" and "durationFontSize" or "countFontSize"
         frame.state.layout[fontKey] = ClampFontSize(fontSizeInput:GetText())
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end)
     TrackControl(fontApply, "textControls")
@@ -2954,6 +4746,7 @@ function addon:CreateLayoutEditor()
     customModeButton:SetPoint("TOPLEFT", 14, -292)
     customModeButton:SetScript("OnClick", function()
         frame.state.borderMode = "custom"
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end)
     frame.customModeButton = customModeButton
@@ -2963,6 +4756,7 @@ function addon:CreateLayoutEditor()
     blizzardModeButton:SetPoint("LEFT", customModeButton, "RIGHT", 8, 0)
     blizzardModeButton:SetScript("OnClick", function()
         frame.state.borderMode = "blizzard"
+        runtimeUiHelpers.MarkLayoutEditorDirty()
         RefreshLayoutEditorPreview()
     end)
     frame.blizzardModeButton = blizzardModeButton
@@ -3016,10 +4810,12 @@ function addon:CreateLayoutEditor()
     )
     layoutInfo:SetPoint("TOPLEFT", 14, -394)
     TrackControl(layoutInfo, "iconControls")
+    CreateLayoutEditorCoTankControls(frame, controls, TrackControl)
 
     local cancelButton = CreateEditorButton(frame, 180, 24, "Cancel")
     cancelButton:SetPoint("BOTTOMLEFT", 18, 18)
     cancelButton:SetScript("OnClick", function()
+        frame.discardChangesOnHide = true
         frame:Hide()
     end)
 
@@ -3036,9 +4832,15 @@ function addon:CreateLayoutEditor()
     end)
 
     layoutEditorFrame = frame
+    frame.targetKey = "tracker"
     frame.selectedElementKey = "icon"
     frame.selectedTextKey = "count"
     frame:SetScript("OnHide", function()
+        if frame.hasPendingChanges and not frame.discardChangesOnHide then
+            CommitLayoutEditorState()
+        end
+        frame.hasPendingChanges = false
+        frame.discardChangesOnHide = false
         if addon and addon.editModeActive then
             if trackerFrame and trackerFrame.editOverlay then
                 trackerFrame.editOverlay:Show()
@@ -3050,7 +4852,7 @@ function addon:CreateLayoutEditor()
     return frame
 end
 
-function addon:OpenLayoutEditor()
+function addon:OpenLayoutEditor(targetKey)
     if not addon.editModeActive then
         return
     end
@@ -3059,7 +4861,14 @@ function addon:OpenLayoutEditor()
         addon:CreateLayoutEditor()
     end
 
-    LoadLayoutEditorState()
+    local normalizedTargetKey = GetLayoutTargetKey(targetKey)
+    if layoutEditorFrame:IsShown() and layoutEditorFrame.hasPendingChanges
+        and layoutEditorFrame.targetKey ~= normalizedTargetKey
+    then
+        CommitLayoutEditorState()
+    end
+
+    LoadLayoutEditorState(normalizedTargetKey)
     RefreshLayoutEditorPreview()
     UpdateTrackerStrata()
     layoutEditorFrame:Show()
@@ -3124,9 +4933,51 @@ function addon:OnEditModeEnter()
     if trackerFrame.anchor and trackerFrame.anchor.EnableMouse then
         trackerFrame.anchor:EnableMouse(true)
     end
+
+    if coTankContainer then
+        coTankContainer:SetMovable(true)
+        coTankContainer:EnableMouse(true)
+        coTankContainer:RegisterForDrag("LeftButton")
+        coTankContainer:SetScript("OnDragStart", function(self)
+            coTankDragActive = true
+            self:StartMoving()
+        end)
+        coTankContainer:SetScript("OnDragStop", function(self)
+            self:StopMovingOrSizing()
+            coTankDragActive = false
+            addon:SaveCoTankPosition()
+        end)
+
+        local coTankOverlay = coTankContainer.editOverlay
+        if coTankOverlay then
+            coTankOverlay:Show()
+            coTankOverlay:SetBackdropColor(0.48, 0.62, 0.64, 0.34)
+            coTankOverlay:SetBackdropBorderColor(0.86, 0.94, 0.94, 0.95)
+            coTankOverlay.bg:SetColorTexture(0, 0, 0, 0)
+            for _, texture in ipairs(coTankOverlay.allTex) do
+                texture:SetVertexColor(0.88, 0.96, 0.96, 0.22)
+            end
+            coTankOverlay.bg:SetVertexColor(1, 1, 1, 1)
+            if coTankOverlay.previewIcons then
+                for _, icon in ipairs(coTankOverlay.previewIcons) do
+                    icon:SetAlpha(0.95)
+                end
+            end
+            coTankOverlay.label:SetText("")
+        end
+
+        if coTankContainer.anchor and coTankContainer.anchor.EnableMouse then
+            coTankContainer.anchor:EnableMouse(true)
+        end
+        coTankContainer:Show()
+    end
+
     UpdateTrackerStrata()
     RefreshButtonPresentation()
     UpdateAnchorVisibility()
+    for _, frame in ipairs(coTankFrames) do
+        runtimeUiHelpers.ApplyCoTankFrameInteraction(frame)
+    end
 end
 
 function addon:OnEditModeExit()
@@ -3158,14 +5009,48 @@ function addon:OnEditModeExit()
     if trackerFrame.anchor and trackerFrame.anchor.EnableMouse then
         trackerFrame.anchor:EnableMouse(false)
     end
+
+    if coTankContainer then
+        coTankDragActive = false
+        coTankContainer:SetMovable(false)
+        coTankContainer:EnableMouse(false)
+        coTankContainer:RegisterForDrag()
+        coTankContainer:SetScript("OnDragStart", nil)
+        coTankContainer:SetScript("OnDragStop", nil)
+
+        local coTankOverlay = coTankContainer.editOverlay
+        if coTankOverlay then
+            coTankOverlay.bg:SetColorTexture(0, 0, 0, 0)
+            coTankOverlay:SetBackdropColor(0, 0, 0, 0)
+            coTankOverlay:SetBackdropBorderColor(0, 0, 0, 0)
+            for _, texture in ipairs(coTankOverlay.allTex) do
+                texture:SetVertexColor(0, 0, 0, 0)
+            end
+            if coTankOverlay.previewIcons then
+                for _, icon in ipairs(coTankOverlay.previewIcons) do
+                    icon:SetAlpha(0)
+                end
+            end
+            coTankOverlay.label:SetText("")
+            coTankOverlay:Hide()
+        end
+
+        if coTankContainer.anchor and coTankContainer.anchor.EnableMouse then
+            coTankContainer.anchor:EnableMouse(false)
+        end
+    end
     if layoutEditorFrame and layoutEditorFrame.Hide then
         layoutEditorFrame:Hide()
     end
 
     addon:SaveTrackerPosition()
+    addon:SaveCoTankPosition()
     UpdateTrackerStrata()
     RefreshButtonPresentation()
     UpdateAnchorVisibility()
+    for _, frame in ipairs(coTankFrames) do
+        runtimeUiHelpers.ApplyCoTankFrameInteraction(frame)
+    end
 end
 
 function addon:UpdateTrackedAuras(reason)
@@ -3178,6 +5063,16 @@ function addon:UpdateDurationTexts()
         local button = buttons[i]
         if button and button:IsShown() then
             UpdateDuration(button, now)
+        end
+    end
+
+    for _, frame in ipairs(coTankFrames) do
+        if frame and frame.auraButtons and frame:IsShown() then
+            for _, button in ipairs(frame.auraButtons) do
+                if button and button:IsShown() then
+                    UpdateDuration(button, now)
+                end
+            end
         end
     end
 end
@@ -3241,9 +5136,22 @@ function addon:InitTracker()
         watchButtons[i] = CreateWatchButton(trackerFrame, i)
     end
 
+    EnsureCoTankContainer()
+    if coTankContainer and coTankContainer.SetFrameStrata then
+        coTankContainer:SetFrameStrata(TRACKER_NORMAL_STRATA)
+    end
+    if coTankContainer and coTankContainer.SetFrameLevel and trackerFrame.GetFrameLevel then
+        coTankContainer:SetFrameLevel(trackerFrame:GetFrameLevel() + 2)
+    end
+    if coTankContainer and not coTankContainer.anchor then
+        coTankContainer.anchor = CreateCoTankAnchor(coTankContainer)
+    end
     trackerFrame.anchor = CreateAnchor(trackerFrame)
 
     addon:CreateEditModeOverlay()
+    if coTankContainer and not coTankContainer.editOverlay then
+        addon:CreateCoTankEditModeOverlay()
+    end
     addon:SetupEditModeHooks()
     RefreshTrackerLayout()
     EnsureTrackerOnScreen()
@@ -3274,6 +5182,8 @@ function addon:InitTracker()
     addon.TrackerFrame = trackerFrame
     addon.AuraButtons = buttons
     addon.WatchButtons = watchButtons
+    addon.CoTankContainer = coTankContainer
+    addon.CoTankFrames = coTankFrames
     addon.TrackerEventFrame = trackerEventFrame
     playerGUID = UnitGUID and UnitGUID("player") or nil
     combatStateActive = IsInCombat()
@@ -3331,7 +5241,7 @@ function addon:DiagnosticScan()
                 .. " error=" .. tostring(debugCall.error))
             for _, aura in ipairs(auras) do
                 if aura and aura.auraIndex then
-                    local tooltipSpellId = GetTooltipSpellIDByAuraIndex(aura.auraIndex, aura.queryFilter)
+                    local tooltipSpellId = GetTooltipSpellIDByAuraIndex("player", aura.auraIndex, aura.queryFilter)
                     local ok, matched = pcall(function()
                         return tooltipSpellId ~= nil and tooltipSpellId == spellInfo.spellId
                     end)
@@ -3347,7 +5257,7 @@ function addon:DiagnosticScan()
         print("  Track: no tracked spells selected")
     end
     for i, aura in ipairs(auras) do
-        local tooltipDebug = aura and aura.auraIndex and GetTooltipAuraDebugByAuraIndex(aura.auraIndex, aura.queryFilter) or nil
+        local tooltipDebug = aura and aura.auraIndex and GetTooltipAuraDebugByAuraIndex("player", aura.auraIndex, aura.queryFilter) or nil
         print("    " .. i .. ") " .. tostring(aura.name or "?")
             .. " [ID:" .. tostring(aura.spellId or 0)
             .. " instance:" .. tostring(aura.auraInstanceID or "nil")
@@ -3441,6 +5351,30 @@ function addon:ResetTrackerPosition()
         trackerFrame:SetClampedToScreen(true)
     end
     addon:SaveTrackerPosition()
+end
+
+function addon:SaveCoTankPosition()
+    if not coTankContainer then
+        return
+    end
+
+    local point, _, relPoint, x, y = coTankContainer:GetPoint()
+    addon.db.coTankFramePosition = {
+        point = point,
+        relativePoint = relPoint,
+        x = x,
+        y = y,
+        relativeTo = "UIParent",
+    }
+end
+
+function addon:ResetCoTankPosition()
+    if not coTankContainer then
+        return
+    end
+
+    addon.db.coTankFramePosition = ConvertLegacyCoTankPosition(GetDefaultCoTankPosition())
+    ApplyCoTankContainerPosition(true)
 end
 
 function addon:UpdateTrackerLock()
